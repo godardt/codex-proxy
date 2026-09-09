@@ -163,17 +163,18 @@ class ProxyIntegrationTests(unittest.TestCase):
             urllib.request.build_opener(urllib.request.ProxyHandler({})).open(req, timeout=3)
         self.assertEqual(caught.exception.code, 401)
 
-    def run_claude_stream_json(self):
+    def run_claude_stream_json(self, extra_args=()):
         binary = shutil.which(os.environ["CLAUDE_TEST_BINARY"])
         self.assertIsNotNone(binary)
-        env = runtime.claude_env(self.settings, "max")
         # A clean cwd/profile and explicit settings sources exclude local plugins.
-        command = [binary, "--model", "gpt-6-astra(max)", "-p", "Reply with OK.",
-                   "--output-format", "stream-json", "--verbose", "--tools", getattr(self, "claude_tools", ""),
-                   "--setting-sources", "", "--strict-mcp-config", "--mcp-config", '{"mcpServers":{}}']
+        args = ["--model", "gpt-6-astra(max)", *extra_args, "-p", "Reply with OK.",
+                "--output-format", "stream-json", "--verbose", "--tools", getattr(self, "claude_tools", ""),
+                "--setting-sources", "", "--strict-mcp-config", "--mcp-config", '{"mcpServers":{}}']
         if getattr(self, "claude_tools", None):
-            command += ["--allowedTools", self.claude_tools]
-        result = subprocess.run(command, cwd=self.base, env=env, text=True,
+            args += ["--allowedTools", self.claude_tools]
+        forwarded, effort = runtime.parse_launch_args(args, "high")
+        env = runtime.claude_env(self.settings, effort)
+        result = subprocess.run([binary, *forwarded], cwd=self.base, env=env, text=True,
                                 capture_output=True, timeout=60)
         self.assertEqual(result.returncode, 0, result.stderr[-3000:] + result.stdout[-3000:])
         events = [json.loads(line) for line in result.stdout.splitlines() if line.strip()]
@@ -195,6 +196,17 @@ class ProxyIntegrationTests(unittest.TestCase):
     @unittest.skipUnless(os.environ.get("CLAUDE_TEST_BINARY"), "Set CLAUDE_TEST_BINARY to test the actual Claude harness")
     def test_real_claude_stream_json(self):
         self.run_claude_stream_json()
+
+    @unittest.skipUnless(os.environ.get("CLAUDE_TEST_BINARY"), "Set CLAUDE_TEST_BINARY to test actual argument forwarding")
+    def test_real_claude_preserves_option_like_system_prompt(self):
+        for literal in ("--model=gpt-6-astra(max)", "--reasoning=low", "--effort=low", "--"):
+            with self.subTest(literal=literal):
+                requests = self.run_claude_stream_json(["--append-system-prompt", literal])
+                for request in requests:
+                    system = [item for item in request.get("input", [])
+                              if item.get("role") in ("system", "developer")]
+                    text = json.dumps(system) + request.get("instructions", "")
+                    self.assertIn(literal, text)
 
     @unittest.skipUnless(os.environ.get("CLAUDE_TEST_BINARY"), "Set CLAUDE_TEST_BINARY to test actual tool execution")
     def test_real_claude_tool_round_trip(self):

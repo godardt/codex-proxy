@@ -10,6 +10,7 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+import textwrap
 import unittest
 from unittest.mock import patch
 
@@ -88,6 +89,271 @@ class InstallTests(unittest.TestCase):
         target.write_text(f"#!{sys.executable}\n" + body)
         target.chmod(0o755)
         return target
+
+    def staged_args(self, *extra):
+        claude = self.fake_cli("claude-original", "print('Claude Code')\n")
+        proxy = self.fake_cli("proxy-unused", "raise SystemExit(1)\n")
+        return ["--config-dir", self.settings["config_dir"], "--data-dir", self.settings["data_dir"],
+                "--state-dir", self.settings["state_dir"], "--bin-dir", self.settings["bin_dir"],
+                "--paseo-home", str(self.base / "paseo-home"), "--claude-bin", str(claude),
+                "--proxy-binary", str(proxy), "--skip-login", "--skip-paseo-start", "--no-path", *extra]
+
+    def test_paseo_wrapper_uses_runtime_path_and_quoted_node_prefix(self):
+        node = self.fake_cli("node", "print('v22.0.0')\n")
+        paseo = self.fake_cli("paseo", "import json,os,sys\nprint(json.dumps({'path':os.environ['PATH'], 'home':os.environ['PASEO_HOME'], 'args':sys.argv[1:]}))\n")
+        args = self.staged_args("--paseo-bin", str(paseo))
+        installation_path = str(node.parent) + os.pathsep + "/installation-only"
+        with patch.dict(os.environ, {"PATH": installation_path}):
+            install.install(install.parser().parse_args(args))
+        wrapper = Path(self.settings["bin_dir"]) / "paseo-codex"
+        self.assertNotIn("/installation-only", wrapper.read_text())
+        forwarded = ["--version", "space ' quote $literal", ""]
+        for new_path in ("/new node ' $prefix/bin:/usr/bin", ""):
+            with self.subTest(path=new_path):
+                result = subprocess.run([str(wrapper), *forwarded], check=True, capture_output=True,
+                                        text=True, env={**os.environ, "PATH": new_path})
+                self.assertEqual(json.loads(result.stdout), {
+                    "path": str(node.parent) + os.pathsep + new_path,
+                    "home": str(self.base / "paseo-home"), "args": forwarded,
+                })
+
+    def test_launcher_without_prefix_preserves_empty_runtime_path(self):
+        cli = self.fake_cli("print-path", "import os\nprint(repr(os.environ['PATH']))\n")
+        wrapper = self.base / "wrapper"
+        install.write_launcher(wrapper, [cli])
+        result = subprocess.run([str(wrapper)], check=True, capture_output=True, text=True,
+                                env={**os.environ, "PATH": ""})
+        self.assertEqual(result.stdout.strip(), "''")
+
+    def test_bash_login_precedence_preserves_profiles_and_is_idempotent(self):
+        for names, chosen in (((".bash_profile", ".bash_login", ".profile"), ".bash_profile"),
+                              ((".bash_login", ".profile"), ".bash_login"),
+                              ((".profile",), ".profile"), ((), ".profile")):
+            with self.subTest(profiles=names):
+                home = self.base / (chosen + str(len(names)))
+                home.mkdir()
+                originals = {name: f"# existing {name}\n" for name in (".bashrc", *names)}
+                for name, content in originals.items():
+                    (home / name).write_text(content)
+                with patch.dict(os.environ, {"HOME": str(home), "SHELL": "/bin/bash"}):
+                    install.add_path(Path(self.settings["bin_dir"]))
+                    before = {path.name: path.read_bytes() for path in home.iterdir()}
+                    install.add_path(Path(self.settings["bin_dir"]))
+                self.assertEqual({path.name: path.read_bytes() for path in home.iterdir()}, before)
+                for name in (".bashrc", ".bash_profile", ".bash_login", ".profile"):
+                    path = home / name
+                    if name in (".bashrc", chosen):
+                        self.assertTrue(path.read_text().startswith(originals.get(name, "")))
+                        self.assertEqual(path.read_text().count(runtime.MARKER), 1)
+                    elif name in names:
+                        self.assertEqual(path.read_text(), originals[name])
+                    else:
+                        self.assertFalse(path.exists())
+
+    def test_bash_path_update_preserves_dotfile_symlinks_and_modes(self):
+        home = self.base / "home"
+        home.mkdir()
+        targets = []
+        for name in (".bashrc", ".bash_login"):
+            target = self.base / (name + "-target")
+            target.write_text(f"# original {name}\n")
+            target.chmod(0o640)
+            (home / name).symlink_to(target)
+            targets.append(target)
+        profile = home / ".profile"
+        profile.write_text("# lower priority\n")
+        with patch.dict(os.environ, {"HOME": str(home), "SHELL": "/bin/bash"}):
+            install.add_path(Path(self.settings["bin_dir"]))
+            before = {path: path.read_bytes() for path in targets}
+            backups = list(home.glob("*.claude-codex-backup-*"))
+            install.add_path(Path(self.settings["bin_dir"]))
+        self.assertEqual(profile.read_text(), "# lower priority\n")
+        self.assertEqual(list(home.glob("*.claude-codex-backup-*")), backups)
+        for name, target in zip((".bashrc", ".bash_login"), targets):
+            self.assertTrue((home / name).is_symlink())
+            self.assertEqual((home / name).resolve(), target)
+            self.assertEqual(target.read_bytes(), before[target])
+            self.assertTrue(target.read_text().startswith(f"# original {name}\n"))
+            self.assertEqual(target.read_text().count(runtime.MARKER), 1)
+            self.assertEqual(target.stat().st_mode & 0o777, 0o640)
+
+    def test_recursive_paseo_selections_preserve_installed_wrapper(self):
+        paseo = self.fake_cli("paseo-original", "print('original Paseo')\n")
+        args = self.staged_args()
+        install.install(install.parser().parse_args([*args, "--paseo-bin", str(paseo)]))
+        wrapper = Path(self.settings["bin_dir"]) / "paseo-codex"
+        alias = self.base / "paseo-alias"
+        alias.symlink_to(wrapper)
+        discovered = self.base / "paseo"
+        discovered.symlink_to(wrapper)
+        named_wrapper = self.fake_cli("paseo-codex", "print('another wrapper')\n")
+        protected = [wrapper, Path(self.settings["config_dir"]) / "settings.json",
+                     Path(self.settings["config_dir"]) / "proxy.yaml",
+                     self.base / "paseo-home" / "config.json"]
+        before = {path: path.read_bytes() for path in protected}
+        for candidate in (wrapper, alias, named_wrapper, None):
+            with self.subTest(candidate=candidate), \
+                 patch.dict(os.environ, {"PATH": str(self.base)}), \
+                 patch.object(install.Runtime, "stop") as stop, \
+                 patch.object(install, "atomic_write") as write, \
+                 patch.object(install, "write_json") as write_json:
+                extra = ["--paseo-bin", str(candidate)] if candidate else []
+                with self.assertRaisesRegex(runtime.SetupError, "original Paseo executable"):
+                    install.install(install.parser().parse_args([*args, *extra]))
+                stop.assert_not_called()
+                write.assert_not_called()
+                write_json.assert_not_called()
+                self.assertEqual({path: path.read_bytes() for path in protected}, before)
+        result = subprocess.run([str(wrapper)], check=True, capture_output=True, text=True)
+        self.assertEqual(result.stdout.strip(), "original Paseo")
+
+    def concurrent_installers(self, fail_first=False):
+        # Each child instruments the real installer/lock and reports over a socket.
+        # Gates pause the first before settings are written and at transaction end;
+        # the second reports an actual failed nonblocking flock before it waits.
+        script = textwrap.dedent('''
+            import json, os, socket, sys
+            from pathlib import Path
+            sys.path.insert(0, sys.argv[1])
+            import install
+            import claude_codex as runtime
+            channel = socket.socket(fileno=int(sys.argv[2]))
+            role, fail_first = sys.argv[3], sys.argv[4] == "True"
+            opts = install.parser().parse_args(json.loads(sys.argv[5]))
+            settings_path = Path(opts.config_dir) / "settings.json"
+            lock_path = Path(opts.config_dir) / "install.lock"
+            def emit(*event):
+                channel.sendall((json.dumps(event) + "\\n").encode())
+            def gate():
+                if channel.recv(1) != b"x":
+                    raise RuntimeError("parent closed coordination channel")
+            original_flock = runtime.fcntl.flock
+            def flock(handle, operation):
+                if Path(handle.name) == lock_path and operation == runtime.fcntl.LOCK_EX:
+                    try:
+                        original_flock(handle, operation | runtime.fcntl.LOCK_NB)
+                    except BlockingIOError:
+                        emit("contended")
+                        original_flock(handle, operation)
+                    emit("acquired")
+                else:
+                    original_flock(handle, operation)
+            runtime.fcntl.flock = flock
+            original_exists = Path.exists
+            def exists(path):
+                value = original_exists(path)
+                if path == settings_path:
+                    emit("previous-check", value)
+                return value
+            Path.exists = exists
+            original_read = install.read_json
+            def read_json(path):
+                value = original_read(path)
+                if path == settings_path:
+                    emit("previous-read", value)
+                return value
+            install.read_json = read_json
+            original_write = install.write_json
+            def write_json(path, value):
+                if path == settings_path:
+                    emit("settings", value)
+                    if role == "first":
+                        gate()
+                original_write(path, value)
+            install.write_json = write_json
+            original_say = install.say
+            def say(message):
+                original_say(message)
+                if role == "first" and message.startswith("Installation staged;"):
+                    emit("transaction-end")
+                    gate()
+                    if fail_first:
+                        raise RuntimeError("injected installer failure")
+            install.say = say
+            try:
+                install.install(opts)
+            except RuntimeError as exc:
+                emit("failed", str(exc))
+                sys.exit(19)
+            emit("done")
+        ''')
+        args = self.staged_args("--skip-paseo")
+
+        def start(role, extra):
+            parent, child = socket.socketpair()
+            parent.settimeout(10)
+            try:
+                process = subprocess.Popen(
+                    [sys.executable, "-c", script, str(ROOT / "scripts"), str(child.fileno()),
+                     role, str(fail_first), json.dumps([*args, *extra])],
+                    pass_fds=(child.fileno(),), stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                    text=True, env={**os.environ, "HOME": str(self.base)},
+                )
+            finally:
+                child.close()
+            def cleanup():
+                if process.poll() is None:
+                    process.kill()
+                process.communicate(timeout=10)
+                parent.close()
+            self.addCleanup(cleanup)
+            return process, parent
+
+        def receive(channel):
+            line = bytearray()
+            while not line.endswith(b"\n"):
+                piece = channel.recv(1)
+                self.assertTrue(piece, "Installer exited before its expected coordination event")
+                line.extend(piece)
+            return json.loads(line)
+
+        first, first_channel = start("first", ["--port", "18431", "--reasoning", "low"])
+        self.assertEqual(receive(first_channel), ["acquired"])
+        self.assertEqual(receive(first_channel), ["previous-check", False])
+        event, first_settings = receive(first_channel)
+        self.assertEqual(event, "settings")
+        self.assertFalse((Path(self.settings["config_dir"]) / "settings.json").exists())
+        lock_path = Path(self.settings["config_dir"]) / "install.lock"
+        lock_inode = lock_path.stat().st_ino
+        self.assertEqual(lock_path.stat().st_mode & 0o777, 0o600)
+        self.assertEqual(lock_path.parent.stat().st_mode & 0o777, 0o700)
+        second, second_channel = start("second", ["--reasoning", "max"])
+        # This event proves actual kernel lock contention, not just scheduling:
+        # no previous-settings existence check or read is allowed before it.
+        self.assertEqual(receive(second_channel), ["contended"])
+        first_channel.sendall(b"x")
+        self.assertEqual(receive(first_channel), ["transaction-end"])
+        self.assertEqual(runtime.read_json(lock_path.parent / "settings.json"), first_settings)
+        self.assertEqual(runtime.read_json(lock_path.parent / "proxy.yaml"), runtime.proxy_config(first_settings))
+        with self.assertRaises(runtime.SetupError):
+            with runtime.file_lock(lock_path, timeout=0):
+                self.fail("Install lock was released before the transaction ended")
+        first_channel.sendall(b"x")
+        expected = ["failed", "injected installer failure"] if fail_first else ["done"]
+        self.assertEqual(receive(first_channel), expected)
+        self.assertEqual(receive(second_channel), ["acquired"])
+        self.assertEqual(receive(second_channel), ["previous-check", True])
+        self.assertEqual(receive(second_channel), ["previous-read", first_settings])
+        event, second_settings = receive(second_channel)
+        self.assertEqual(event, "settings")
+        self.assertEqual(receive(second_channel), ["done"])
+        for process, expected_code in ((first, 19 if fail_first else 0), (second, 0)):
+            stdout, stderr = process.communicate(timeout=10)
+            self.assertEqual(process.returncode, expected_code, stdout + stderr)
+        self.assertEqual(second_settings["api_key"], first_settings["api_key"])
+        self.assertEqual(second_settings["port"], 18431)
+        self.assertEqual(second_settings["reasoning"], "max")
+        self.assertEqual(runtime.read_json(lock_path.parent / "settings.json"), second_settings)
+        self.assertEqual(runtime.read_json(lock_path.parent / "proxy.yaml"), runtime.proxy_config(second_settings))
+        self.assertEqual(lock_path.stat().st_ino, lock_inode)
+        with runtime.file_lock(lock_path, timeout=0):
+            pass
+
+    def test_concurrent_installers_wait_before_reading_previous_settings(self):
+        self.concurrent_installers()
+
+    def test_installer_failure_releases_lock_for_waiting_installer(self):
+        self.concurrent_installers(fail_first=True)
 
     def test_paseo_merge_preserves_config_and_is_idempotent(self):
         config_file = self.base / "paseo.json"

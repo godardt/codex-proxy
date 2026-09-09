@@ -19,7 +19,7 @@ import time
 
 from claude_codex import (
     CONTEXT_WINDOW, EFFORTS, REASONING_MODES, ULTRACODE_MODEL, MARKER, MODEL, Runtime, SetupError, atomic_write, model_id,
-    proxy_config, read_json, say, write_json,
+    file_lock, proxy_config, read_json, say, write_json,
 )
 
 PROXY_VERSION = "7.2.155"
@@ -201,7 +201,7 @@ def merge_paseo(path, settings, previous):
     write_json(path, config)
 
 
-def write_launcher(path, command, environment=None):
+def write_launcher(path, command, environment=None, path_prepend=None):
     path = Path(path)
     if path.exists() or path.is_symlink():
         try:
@@ -213,6 +213,8 @@ def write_launcher(path, command, environment=None):
     lines = ["#!/bin/sh", MARKER]
     for name, value in (environment or {}).items():
         lines.append(f"export {name}={shlex.quote(str(value))}")
+    if path_prepend is not None:
+        lines.append(f'export PATH={shlex.quote(str(path_prepend))}:"$PATH"')
     lines.append("exec " + shlex.join([str(part) for part in command]) + ' "$@"')
     atomic_write(path, "\n".join(lines) + "\n", mode=0o755)
 
@@ -224,8 +226,9 @@ def add_path(bin_dir):
         zsh_dir = absolute(os.environ.get("ZDOTDIR", str(home_dir)))
         profiles = [zsh_dir / ".zshrc", zsh_dir / ".zprofile"]
     elif shell == "bash":
-        login = home_dir / ".bash_profile"
-        profiles = [home_dir / ".bashrc", login if login.exists() else home_dir / ".profile"]
+        login = next((home_dir / name for name in (".bash_profile", ".bash_login", ".profile")
+                      if (home_dir / name).exists()), home_dir / ".profile")
+        profiles = [home_dir / ".bashrc", login]
     elif shell == "fish":
         config_dir = absolute(os.environ.get("XDG_CONFIG_HOME", str(home_dir / ".config")))
         target = config_dir / "fish" / "conf.d" / "claude-codex.fish"
@@ -281,12 +284,20 @@ def install(opts):
     config_dir, data_dir, state_dir, bin_dir = (
         absolute(getattr(opts, key)) for key in ("config_dir", "data_dir", "state_dir", "bin_dir")
     )
+    with file_lock(config_dir / "install.lock"):
+        return _install_locked(opts, config_dir, data_dir, state_dir, bin_dir)
+
+
+def _install_locked(opts, config_dir, data_dir, state_dir, bin_dir):
     settings_file = config_dir / "settings.json"
     previous = read_json(settings_file) if settings_file.exists() else {}
     port = opts.port if opts.port is not None else previous.get("port", 8317)
     if not 1024 <= port <= 65535:
         raise SetupError("--port must be between 1024 and 65535")
     detected_paseo = None if opts.skip_paseo else detect_paseo(opts.paseo_bin)
+    if detected_paseo and (Path(detected_paseo).name == "paseo-codex"
+                           or Path(detected_paseo).resolve() == (bin_dir / "paseo-codex").resolve()):
+        raise SetupError("--paseo-bin must point to the original Paseo executable")
     use_paseo = detected_paseo is not None
     if not use_paseo:
         say("Paseo integration skipped" if opts.skip_paseo else "Paseo not detected; skipping Paseo installation and configuration")
@@ -347,9 +358,7 @@ def install(opts):
     if paseo_bin:
         merge_paseo(paseo_config, settings, previous)
         paseo_env = {"PASEO_HOME": str(paseo_home)}
-        if settings["node_dir"]:
-            paseo_env["PATH"] = settings["node_dir"] + os.pathsep + os.environ.get("PATH", os.defpath)
-        write_launcher(bin_dir / "paseo-codex", [paseo_bin], paseo_env)
+        write_launcher(bin_dir / "paseo-codex", [paseo_bin], paseo_env, path_prepend=settings["node_dir"])
     if not opts.no_path:
         add_path(bin_dir)
     runtime = Runtime(settings)

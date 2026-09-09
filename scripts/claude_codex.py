@@ -25,6 +25,26 @@ REASONING_MODES = (*EFFORTS, "ultracode")
 ULTRACODE_MODEL = "gpt-6-astra-ultracode"
 MARKER = "# Managed by claude-codex installer"
 
+# Native Claude options with operands, including hidden SDK options. Keep this
+# in sync with supported CLI versions; unknown flags still pass through.
+CLAUDE_VARIADIC_OPTIONS = {
+    "--add-dir", "--allowedTools", "--allowed-tools", "--betas", "--disallowedTools",
+    "--disallowed-tools", "--file", "--mcp-config", "--tools",
+}
+CLAUDE_VALUE_OPTIONS = CLAUDE_VARIADIC_OPTIONS | {
+    "--agent", "--agents", "--append-system-prompt", "--append-system-prompt-file",
+    "--autocompact", "--debug-file", "--environment", "--fallback-model", "--input-format",
+    "--json-schema", "--max-budget-usd", "--max-turns", "--name", "-n", "--output-format",
+    "--permission-mode", "--permission-prompt-tool", "--permission-prompts", "--plugin-dir",
+    "--plugin-url", "--remote-control-session-name-prefix", "--resume-session-at",
+    "--rewind-files", "--sdk-url", "--session-id", "--setting-sources", "--settings",
+    "--system-prompt", "--system-prompt-file", "--system-prompt-snapshot",
+}
+CLAUDE_OPTIONAL_VALUE_OPTIONS = {
+    "--cloud", "--debug", "-d", "--from-pr", "--prompt-suggestions", "--remote-control",
+    "--resume", "-r", "--teleport", "--worktree", "-w",
+}
+
 
 class SetupError(Exception):
     pass
@@ -63,6 +83,30 @@ def atomic_write(path, content, mode=0o600):
 
 def write_json(path, value):
     atomic_write(path, json.dumps(value, indent=2) + "\n")
+
+
+@contextlib.contextmanager
+def file_lock(path, timeout=None, busy_message="Another operation is busy; try again shortly"):
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    with path.open("a") as handle:
+        os.fchmod(handle.fileno(), 0o600)
+        if timeout is None:
+            fcntl.flock(handle, fcntl.LOCK_EX)
+        else:
+            deadline = time.monotonic() + timeout
+            while True:
+                try:
+                    fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except BlockingIOError:
+                    if time.monotonic() >= deadline:
+                        raise SetupError(busy_message)
+                    time.sleep(0.1)
+        try:
+            yield
+        finally:
+            fcntl.flock(handle, fcntl.LOCK_UN)
 
 
 def effort_value(value):
@@ -133,6 +177,19 @@ def parse_launch_args(args, default_effort):
                 selected = value
         else:
             forwarded.append(arg)
+            # Required operands belong to the native option even if they look
+            # like our selectors or the literal "--" separator.
+            if key in CLAUDE_VALUE_OPTIONS and not equal:
+                i += 1
+                if i >= len(args):
+                    raise SetupError(f"{key} needs a value")
+                forwarded.append(args[i])
+            if key in CLAUDE_VARIADIC_OPTIONS or (key in CLAUDE_OPTIONAL_VALUE_OPTIONS and not equal):
+                while i + 1 < len(args) and (not args[i + 1].startswith("-") or args[i + 1] == "-"):
+                    i += 1
+                    forwarded.append(args[i])
+                    if key not in CLAUDE_VARIADIC_OPTIONS:
+                        break
         i += 1
     suffix_effort = None
     if selected == ULTRACODE_MODEL:
@@ -203,24 +260,9 @@ class Runtime:
     def command(self):
         return [self.settings["proxy_bin"], "-config", str(self.config_file)]
 
-    @contextlib.contextmanager
     def lock(self):
-        self.state_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
-        with (self.state_dir / "proxy.lock").open("a") as handle:
-            os.chmod(handle.name, 0o600)
-            deadline = time.monotonic() + 40
-            while True:
-                try:
-                    fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                    break
-                except BlockingIOError:
-                    if time.monotonic() > deadline:
-                        raise SetupError("Another proxy operation is busy; try again shortly")
-                    time.sleep(0.1)
-            try:
-                yield
-            finally:
-                fcntl.flock(handle, fcntl.LOCK_UN)
+        return file_lock(self.state_dir / "proxy.lock", timeout=40,
+                         busy_message="Another proxy operation is busy; try again shortly")
 
     def request(self, path, payload=None, timeout=3):
         req = urllib.request.Request(
@@ -319,26 +361,34 @@ class Runtime:
                 self.child = None
             self.pid_file.unlink(missing_ok=True)
 
-    def has_login(self):
+    def login_credentials(self):
+        credentials = {}
         for path in (self.config_dir / "auth").glob("*.json"):
             try:
                 auth = read_json(path)
                 if auth.get("type") == "codex" and auth.get("refresh_token") and not auth.get("disabled"):
-                    return True
-            except SetupError:
+                    stat = path.stat()
+                    credentials[path] = (auth, stat.st_dev, stat.st_ino, stat.st_mtime_ns)
+            except (SetupError, OSError):
                 continue
-        return False
+        return credentials
+
+    def has_login(self):
+        return bool(self.login_credentials())
 
     def login(self, device=False, no_browser=False):
         self.stop()
+        previous = self.login_credentials()
         args = [*self.command, "-codex-device-login" if device else "-codex-login"]
         if no_browser:
             args.append("-no-browser")
         say("Sign in with the ChatGPT account whose subscription you want to use.")
         subprocess.run(args, cwd=self.state_dir, check=True)
         # Some CLIProxyAPI login failures are logged but return exit status 0.
-        if not self.has_login():
-            raise SetupError("No Codex OAuth credentials were saved. Run claude-codex-proxy login again.")
+        # Old credentials cannot prove this attempt saved a login. File identity
+        # and mtime also recognize successful rewrites of identical credentials.
+        if not any(previous.get(path) != credential for path, credential in self.login_credentials().items()):
+            raise SetupError("No new or updated Codex OAuth credentials were saved. Run claude-codex-proxy login again.")
         for path in (self.config_dir / "auth").glob("*.json"):
             path.chmod(0o600)
 
