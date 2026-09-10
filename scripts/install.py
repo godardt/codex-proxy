@@ -146,6 +146,8 @@ def provider(settings):
         "description": "Claude Code harness via CLIProxyAPI and ChatGPT subscription OAuth",
         "command": [str(Path(settings["bin_dir"]) / "claude-codex")],
         "enabled": True,
+        # No CLAUDE_CONFIG_DIR here: Paseo reloads transcripts from the profile
+        # its daemon resolves, so the launcher keeps that profile for Paseo.
         "env": {
             "ANTHROPIC_BASE_URL": f"http://127.0.0.1:{settings['port']}",
             # Advertises gateway authentication to Paseo's availability detection.
@@ -153,7 +155,6 @@ def provider(settings):
             "ANTHROPIC_AUTH_TOKEN": "provided-by-claude-codex-launcher",
             "CLAUDE_CODE_MAX_CONTEXT_TOKENS": str(CONTEXT_WINDOW),
             "CLAUDE_CODEX_PASEO_USAGE": "1",
-            "CLAUDE_CONFIG_DIR": str(Path(settings["config_dir"]) / "claude"),
         },
         "disallowedTools": ["WebSearch"],
         "models": [{

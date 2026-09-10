@@ -9,6 +9,7 @@ import math
 import os
 from pathlib import Path
 import re
+import shutil
 import signal
 import socket
 import subprocess
@@ -211,6 +212,24 @@ def parse_launch_args(args, default_effort):
     return ["--model", model_id(effort), *forwarded, *native_args, *tail], effort
 
 
+def isolated_profile(settings):
+    return str(Path(settings["config_dir"]) / "claude")
+
+
+def paseo_mode(env):
+    # Set by the generated Paseo provider entry; never by terminal launches.
+    return env.get("CLAUDE_CODEX_PASEO_USAGE") == "1"
+
+
+def daemon_profile(env):
+    """The Claude profile Paseo's daemon reads transcripts from.
+
+    Paseo resolves history files from its own CLAUDE_CONFIG_DIR, or ~/.claude,
+    not from the environment of the provider it spawns.
+    """
+    return Path(env.get("CLAUDE_CONFIG_DIR") or Path.home() / ".claude")
+
+
 def claude_env(settings, effort, source=None):
     env = dict(os.environ if source is None else source)
     for name in (
@@ -230,7 +249,6 @@ def claude_env(settings, effort, source=None):
         "CLAUDE_CODE_SUBAGENT_MODEL": selected,
         # Declare Astra's full window for this non-Claude gateway model ID.
         "CLAUDE_CODE_MAX_CONTEXT_TOKENS": str(CONTEXT_WINDOW),
-        "CLAUDE_CONFIG_DIR": str(Path(settings["config_dir"]) / "claude"),
         "API_TIMEOUT_MS": "600000",
         "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1",
         "CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS": "1",
@@ -238,6 +256,16 @@ def claude_env(settings, effort, source=None):
     })
     for alias in ("OPUS", "SONNET", "HAIKU", "FABLE"):
         env[f"ANTHROPIC_DEFAULT_{alias}_MODEL"] = selected
+    if paseo_mode(env):
+        # Paseo reloads an agent's transcript from the profile its daemon
+        # resolves. Sessions recorded in the isolated profile are invisible to
+        # it, so the conversation appears empty after a daemon restart or
+        # reload. Provider entries written by older installers still pin the
+        # isolated profile; drop that so Claude uses the daemon's profile.
+        if env.get("CLAUDE_CONFIG_DIR") == isolated_profile(settings):
+            del env["CLAUDE_CONFIG_DIR"]
+    else:
+        env["CLAUDE_CONFIG_DIR"] = isolated_profile(settings)
     # Local traffic must bypass inherited HTTP proxies, including in GUI daemons.
     for name in ("NO_PROXY", "no_proxy"):
         env[name] = ",".join(filter(None, [env.get(name), "127.0.0.1", "localhost"]))
@@ -473,6 +501,50 @@ class PaseoUsageStream:
         return (json.dumps(message, separators=(",", ":")) + "\n").encode() if changed else line
 
 
+def resumed_session(args):
+    """Return the session ID given to a native --resume/-r option, if any."""
+    i = 0
+    while i < len(args):
+        arg = args[i]
+        if arg == "--":
+            return None
+        key, equal, value = arg.partition("=")
+        if key in ("--resume", "-r"):
+            if not equal:
+                value = args[i + 1] if i + 1 < len(args) else ""
+            return value if re.fullmatch(r"[0-9a-fA-F-]{36}", value) else None
+        if key in CLAUDE_VALUE_OPTIONS and not equal:
+            i += 1  # A required operand is never an option, even if it looks like one.
+        i += 1
+    return None
+
+
+def adopt_isolated_transcript(settings, args, env):
+    """Move a resumed session recorded by an older launcher into Paseo's profile.
+
+    Before Paseo launches used the daemon's profile, transcripts went to the
+    isolated profile. Moving the exact session Paseo resumes lets Claude find
+    the conversation and lets Paseo display it after its next reload.
+    """
+    session_id = resumed_session(args)
+    if not session_id:
+        return
+    source = Path(isolated_profile(settings)) / "projects"
+    target = daemon_profile(env) / "projects"
+    if not source.is_dir() or (target.exists() and target.samefile(source)):
+        return
+    for transcript in source.glob(f"*/{session_id}.jsonl"):
+        destination = target / transcript.parent.name / transcript.name
+        if destination.exists():
+            continue
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.move(str(transcript), str(destination))
+        # Subagent and workflow transcripts live in a directory named after the session.
+        sidechains = transcript.with_suffix("")
+        if sidechains.is_dir() and not destination.with_suffix("").exists():
+            shutil.move(str(sidechains), str(destination.with_suffix("")))
+
+
 def is_stream_json(args):
     options = args[:args.index("--")] if "--" in args else args
     return "--output-format=stream-json" in options or any(
@@ -535,8 +607,14 @@ def launch(settings, args):
         runtime.start()
     binary = settings["claude_bin"]
     env = claude_env(settings, effort)
-    if env.get("CLAUDE_CODEX_PASEO_USAGE") == "1" and is_stream_json(forwarded):
-        raise SystemExit(run_paseo_stream(binary, forwarded, env))
+    if paseo_mode(env):
+        if not probe:
+            try:
+                adopt_isolated_transcript(settings, forwarded, env)
+            except OSError as exc:
+                say(f"claude-codex: could not move the earlier transcript into Paseo's Claude profile: {exc}")
+        if is_stream_json(forwarded):
+            raise SystemExit(run_paseo_stream(binary, forwarded, env))
     os.execve(binary, [binary, *forwarded], env)
 
 

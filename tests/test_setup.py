@@ -73,6 +73,21 @@ class LauncherTests(unittest.TestCase):
         self.assertEqual(env["CLAUDE_CONFIG_DIR"], "/tmp/test config/claude")
         self.assertEqual(env["NO_PROXY"], "example.test,127.0.0.1,localhost")
 
+    def test_paseo_sessions_use_the_daemon_profile(self):
+        # Paseo reloads transcripts from the daemon's CLAUDE_CONFIG_DIR or ~/.claude,
+        # not from the provider environment, so Paseo launches keep that profile.
+        settings = {"port": 8317, "api_key": "local-test-key", "config_dir": "/tmp/test config"}
+        paseo = {"CLAUDE_CODEX_PASEO_USAGE": "1", "PATH": "/bin"}
+        self.assertNotIn("CLAUDE_CONFIG_DIR", runtime.claude_env(settings, "high", paseo))
+        daemon = runtime.claude_env(settings, "high", {**paseo, "CLAUDE_CONFIG_DIR": "/daemon/claude"})
+        self.assertEqual(daemon["CLAUDE_CONFIG_DIR"], "/daemon/claude")
+        # Provider entries written by older installers pinned the isolated profile.
+        stale = runtime.claude_env(settings, "high", {**paseo, "CLAUDE_CONFIG_DIR": "/tmp/test config/claude"})
+        self.assertNotIn("CLAUDE_CONFIG_DIR", stale)
+        self.assertEqual(stale["ANTHROPIC_MODEL"], "gpt-6-astra(high)")
+        terminal = runtime.claude_env(settings, "high", {"CLAUDE_CONFIG_DIR": "/shell/claude", "PATH": "/bin"})
+        self.assertEqual(terminal["CLAUDE_CONFIG_DIR"], "/tmp/test config/claude")
+
 
 class InstallTests(unittest.TestCase):
     def setUp(self):
@@ -369,6 +384,7 @@ class InstallTests(unittest.TestCase):
         self.assertEqual(provider["extends"], "claude")
         self.assertEqual(provider["env"]["CLAUDE_CODE_MAX_CONTEXT_TOKENS"], "1050000")
         self.assertEqual(provider["env"]["CLAUDE_CODEX_PASEO_USAGE"], "1")
+        self.assertNotIn("CLAUDE_CONFIG_DIR", provider["env"])
         self.assertEqual(len(provider["models"]), 6)
         xhigh = next(model for model in provider["models"] if model["id"] == "gpt-6-astra(xhigh)")
         self.assertEqual([option["id"] for option in xhigh["thinkingOptions"]], ["default", "ultracode"])
@@ -419,7 +435,7 @@ class InstallTests(unittest.TestCase):
 
     def test_full_staged_install_and_launch_with_sdk_arguments(self):
         claude = self.fake_cli("claude-original", "import json,os,sys\nprint(json.dumps({'args':sys.argv[1:],'model':os.environ.get('ANTHROPIC_MODEL'),'base':os.environ.get('ANTHROPIC_BASE_URL')}))\n")
-        paseo = self.fake_cli("paseo-original", "print('0.8.0-beta.1')\n")
+        paseo = self.fake_cli("paseo-original", "print('paseo original')\n")
         proxy = self.fake_cli("proxy-unused", "raise SystemExit(1)\n")
         claude_before = claude.read_bytes()
         args = ["bash", str(ROOT / "install.sh"), "--config-dir", self.settings["config_dir"],
@@ -461,10 +477,10 @@ class InstallTests(unittest.TestCase):
         self.assertFalse((Path(self.settings["bin_dir"]) / "paseo-codex").exists())
         self.assertFalse((Path(self.settings["data_dir"]) / "npm" / "paseo").exists())
 
-    def test_installer_reuses_system_paseo_over_saved_private_beta(self):
+    def test_installer_reuses_system_paseo_over_saved_private_copy(self):
         claude = self.fake_cli("claude-original", "print('Claude Code')\n")
-        system_paseo = self.fake_cli("paseo", "print('0.7.2')\n")
-        private_paseo = self.fake_cli("paseo-private", "print('0.8.0-beta.1')\n")
+        system_paseo = self.fake_cli("paseo", "print('paseo on PATH')\n")
+        private_paseo = self.fake_cli("paseo-private", "print('private paseo')\n")
         proxy = self.fake_cli("proxy-unused", "raise SystemExit(1)\n")
         original = system_paseo.read_bytes()
         with socket.socket() as probe:
@@ -486,10 +502,10 @@ class InstallTests(unittest.TestCase):
         self.assertFalse((Path(self.settings["data_dir"]) / "npm" / "paseo").exists())
         wrapper = Path(self.settings["bin_dir"]) / "paseo-codex"
         result = subprocess.run([str(wrapper), "--version"], check=True, capture_output=True, text=True)
-        self.assertEqual(result.stdout.strip(), "0.7.2")
+        self.assertEqual(result.stdout.strip(), "paseo on PATH")
 
     def test_explicit_paseo_is_used_without_version_checks(self):
-        custom = self.fake_cli("paseo-custom", "print('0.9.0')\n")
+        custom = self.fake_cli("paseo-custom", "print('custom paseo')\n")
         with patch.object(install.subprocess, "check_output") as version_probe:
             self.assertEqual(install.detect_paseo(str(custom)), str(custom))
         version_probe.assert_not_called()
@@ -497,7 +513,7 @@ class InstallTests(unittest.TestCase):
     def test_missing_system_paseo_does_not_select_legacy_private_copy(self):
         private = self.base / "npm" / "paseo" / "node_modules" / ".bin" / "paseo"
         private.parent.mkdir(parents=True)
-        private.write_text("#!/bin/sh\necho 0.8.0-beta.1\n")
+        private.write_text("#!/bin/sh\necho legacy private paseo\n")
         private.chmod(0o755)
         with patch.dict(os.environ, {"PATH": ""}):
             self.assertIsNone(install.detect_paseo(None))
