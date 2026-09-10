@@ -77,6 +77,68 @@ class ArgumentBoundaryTests(unittest.TestCase):
             runtime.parse_launch_args(["--reasoning=ultracode", "--system-prompt"], "high")
 
 
+class PaseoTranscriptTests(unittest.TestCase):
+    """Sessions recorded by older launchers move into the profile Paseo reads."""
+
+    SESSION = "0b7d9a8c-1111-4222-8333-444455556666"
+
+    def test_resume_operand_must_look_like_a_session_id(self):
+        session = self.SESSION
+        for args in (["--model", "x", "--resume", session, "--output-format", "stream-json"],
+                     ["-r", session], [f"--resume={session}"], ["-p", "Hi", "-r", session.upper()]):
+            with self.subTest(args=args):
+                self.assertEqual(runtime.resumed_session(args).lower(), session)
+        for args in ([], ["--resume"], ["--resume", "--model=x"], ["--resume", "filter text"],
+                     ["--resume", "-"], ["--resume="], ["--", "--resume", session],
+                     ["--append-system-prompt", "--resume", session]):
+            with self.subTest(args=args):
+                self.assertIsNone(runtime.resumed_session(args))
+
+    def test_resumed_session_moves_into_daemon_profile_once(self):
+        with tempfile.TemporaryDirectory(prefix="claude-codex-transcript-test-") as temp:
+            base = Path(temp)
+            settings = {"config_dir": str(base / "config")}
+            project = "-home-user-project"
+            source = base / "config" / "claude" / "projects" / project
+            source.mkdir(parents=True)
+            (source / f"{self.SESSION}.jsonl").write_text('{"type":"user"}\n')
+            (source / self.SESSION / "subagents").mkdir(parents=True)
+            (source / self.SESSION / "subagents" / "agent-1.jsonl").write_text("{}\n")
+            (source / "unrelated.jsonl").write_text("{}\n")
+            env = {"CLAUDE_CODEX_PASEO_USAGE": "1", "CLAUDE_CONFIG_DIR": str(base / "daemon")}
+            args = ["--model", "gpt-6-astra(high)", "--resume", self.SESSION, "--output-format", "stream-json"]
+            runtime.adopt_isolated_transcript(settings, args, env)
+            target = base / "daemon" / "projects" / project
+            self.assertEqual((target / f"{self.SESSION}.jsonl").read_text(), '{"type":"user"}\n')
+            self.assertTrue((target / self.SESSION / "subagents" / "agent-1.jsonl").is_file())
+            self.assertFalse((source / f"{self.SESSION}.jsonl").exists())
+            self.assertFalse((source / self.SESSION).exists())
+            self.assertTrue((source / "unrelated.jsonl").is_file())
+            # The transcript Paseo already reads is never replaced by an older copy.
+            (target / f"{self.SESSION}.jsonl").write_text("current\n")
+            (source / f"{self.SESSION}.jsonl").write_text("stale\n")
+            runtime.adopt_isolated_transcript(settings, args, env)
+            self.assertEqual((target / f"{self.SESSION}.jsonl").read_text(), "current\n")
+            self.assertEqual((source / f"{self.SESSION}.jsonl").read_text(), "stale\n")
+            # Without a resumed session, or when both profiles coincide, nothing moves.
+            runtime.adopt_isolated_transcript(settings, ["-p", "Hi"], env)
+            runtime.adopt_isolated_transcript(settings, args, {"CLAUDE_CONFIG_DIR": str(base / "config" / "claude")})
+            self.assertEqual((source / f"{self.SESSION}.jsonl").read_text(), "stale\n")
+
+    def test_daemon_profile_defaults_to_home_claude(self):
+        with tempfile.TemporaryDirectory(prefix="claude-codex-transcript-test-") as temp:
+            base = Path(temp)
+            settings = {"config_dir": str(base / "config")}
+            source = base / "config" / "claude" / "projects" / "-work"
+            source.mkdir(parents=True)
+            (source / f"{self.SESSION}.jsonl").write_text("{}\n")
+            with patch.dict(os.environ, {"HOME": str(base / "home")}):
+                self.assertEqual(runtime.daemon_profile({}), base / "home" / ".claude")
+                runtime.adopt_isolated_transcript(settings, [f"--resume={self.SESSION}"], {})
+            self.assertTrue((base / "home" / ".claude" / "projects" / "-work" / f"{self.SESSION}.jsonl").is_file())
+            self.assertFalse((source / f"{self.SESSION}.jsonl").exists())
+
+
 class LoginTests(unittest.TestCase):
     def setUp(self):
         temp = tempfile.TemporaryDirectory(prefix="claude-codex-login-test-")

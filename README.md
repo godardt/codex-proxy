@@ -2,7 +2,7 @@
 
 Run the **Claude Code harness with GPT-6 Astra**, using your ChatGPT subscription through CLIProxyAPI's Codex OAuth provider. A separate `claude-codex` command configures the proxy connection and reasoning level. The original `claude` executable and its user configuration stay in place.
 
-Optionally adds a separate **Claude Codex · GPT-6 Astra** provider to an existing Paseo installation. Paseo is not required for terminal use. Compatibility has been tested with **Paseo v0.8.0-beta.1**.
+Optionally adds a separate **Claude Codex · GPT-6 Astra** provider to an existing Paseo installation. Paseo is not required for terminal use. No particular Paseo version is assumed; the installer uses whichever Paseo executable you have.
 
 ```text
 Terminal: claude-codex ──────────┐
@@ -14,7 +14,7 @@ Paseo: Claude Codex provider ────┘
 
 This repository contains a **Python standard-library installer and launcher**, not a fork of Claude Code, Paseo, or CLIProxyAPI. Claude Code supplies the terminal/agent harness; CLIProxyAPI translates its Anthropic-format requests into Codex requests authenticated with ChatGPT OAuth.
 
-- **`claude-codex`** launches Claude Code with an isolated user profile, Astra model mappings, and the selected reasoning level. It starts the managed local proxy when needed.
+- **`claude-codex`** launches Claude Code with Astra model mappings and the selected reasoning level, using an isolated user profile for terminal sessions. It starts the managed local proxy when needed.
 - **`claude-codex-proxy`** manages proxy startup/shutdown, login, diagnostics, and the persistent terminal reasoning default.
 - **`paseo-codex`**, installed only when Paseo is detected, invokes your existing Paseo executable with the configured home. The generated provider uses `claude-codex` and a stream-JSON usage adapter for Paseo's context meter.
 
@@ -109,6 +109,12 @@ After installation, select the **Claude Codex · GPT-6 Astra** provider when cre
 
 The context circle uses the last completed main-agent request's measured input and output tokens, including cached input. For Paseo's stream-JSON connection, the launcher removes provisional input estimates and supplies final per-request usage to its adapter. Text still streams immediately; the meter updates when the turn completes. Totals from earlier turns and subagents are not added to the current context size. This compatibility adapter is enabled by the provider's `CLAUDE_CODEX_PASEO_USAGE` environment setting and does not modify the installed Paseo package.
 
+### Conversation history in Paseo
+
+Paseo reloads an agent's transcript from the Claude profile **its daemon** resolves: the daemon's own `CLAUDE_CONFIG_DIR`, or `~/.claude`. It does not consult the environment of the provider it spawns. Paseo sessions therefore run in that profile rather than in the launcher's isolated profile, so the conversation survives daemon restarts, reloads, and reopening the app. The isolated profile remains in use for terminal launches only.
+
+Earlier versions recorded Paseo sessions in the isolated profile, which made a conversation appear empty whenever Paseo reloaded it from disk. After updating, rerun the installer so the provider entry no longer pins the isolated profile, then reload Paseo. When Paseo resumes an agent created before the update, the launcher moves that session's transcript into the daemon's profile; Claude continues the conversation immediately, and Paseo shows the earlier history after its next reload or daemon restart. The user-level settings, hooks, and plugins of the daemon's profile apply to Paseo sessions, the same as for Paseo's regular Claude provider.
+
 The five API reasoning levels are encoded in model IDs. For consistent helper/subagent effort, choose the variant when creating the session; helpers retain their launch-time environment if you change the main model during a session.
 
 ### Ultra Code
@@ -134,7 +140,7 @@ paseo-codex provider diagnostic claude-codex
 paseo-codex run --provider claude-codex 'Explain this project'
 ```
 
-The regular Claude provider remains available. Install on each remote **daemon host**, not just on the phone or desktop UI; `127.0.0.1` refers to that host. The installed version must support custom providers that extend Claude and the documented daemon commands. This integration was tested with 0.8.0-beta.1; version management for the daemon and desktop/mobile UI remains yours.
+The regular Claude provider remains available. Install on each remote **daemon host**, not just on the phone or desktop UI; `127.0.0.1` refers to that host. The installed version must support custom providers that extend Claude and the documented daemon commands. Version management for the daemon and desktop/mobile UI remains yours.
 
 ## Installer options
 
@@ -149,7 +155,7 @@ bash install.sh --device-login
 bash install.sh --no-browser
 
 # Different local port and Paseo home.
-bash install.sh --port 18317 --paseo-home ~/.paseo-beta
+bash install.sh --port 18317 --paseo-home ~/.paseo-work
 
 # Choose existing executables explicitly.
 bash install.sh --claude-bin /path/to/claude --paseo-bin /path/to/paseo
@@ -196,7 +202,7 @@ Default files:
 | `~/.config/claude-codex/proxy.yaml` | Generated CLIProxyAPI configuration (JSON syntax, valid YAML) |
 | `~/.config/claude-codex/install.lock` | Persistent lock file used to serialize installers for this configuration |
 | `~/.config/claude-codex/auth/` | ChatGPT OAuth credentials |
-| `~/.config/claude-codex/claude/` | Isolated Claude user profile and sessions |
+| `~/.config/claude-codex/claude/` | Isolated Claude user profile and sessions for terminal launches |
 | `~/.local/share/claude-codex/` | Runtime, versioned proxy binary, optional private npm CLIs |
 | `~/.local/state/claude-codex/` | PID, lock, startup log, rotating CLIProxyAPI logs |
 | `~/.paseo/config.json` | Merged provider entry; timestamped backup beside it |
@@ -213,17 +219,18 @@ Troubleshooting:
 - **Executable rejected as recursive:** point `--claude-bin` or `--paseo-bin` at the original executable, not an installed integration wrapper or a symlink to it.
 - **Astra unavailable / 403 / quota error:** check access on the signed-in account and run `doctor --smoke-test`. The proxy catalog alone does not prove entitlement, and changing the model name cannot add subscription access.
 - **Paseo provider absent:** use `paseo-codex reload`, confirm app/daemon version and `PASEO_HOME`, then run the provider diagnostic above. If Paseo reports that a restart is required, restart its daemon after finishing active sessions.
+- **Paseo shows an empty conversation for an existing agent:** the transcript is not in the profile the daemon reads. Rerun the installer and reload Paseo; see "Conversation history in Paseo" above. Sending one message to the agent moves an older transcript across, and the history returns after the next reload.
 - **Proxy startup failure:** inspect `~/.local/state/claude-codex/proxy-startup.log` and the `logs/` directory there. Avoid sharing credentials from config files.
 - **Unexpected routing:** inspect project `.claude/settings.json`, `.claude/settings.local.json`, and managed settings for conflicting model/provider environment variables.
 
-This is a third-party compatibility bridge. Claude's server-side `WebSearch` is disabled because it is not supported by this integration; use a separately configured search tool if needed. Existing user-level Claude plugins, credentials, and settings are not copied into the isolated profile. Project `CLAUDE.md` and project settings load normally. Native Claude/Codex features are not all interchangeable through an API translator.
+This is a third-party compatibility bridge. Claude's server-side `WebSearch` is disabled because it is not supported by this integration; use a separately configured search tool if needed. Existing user-level Claude plugins, credentials, and settings are not copied into the terminal launcher's isolated profile. Project `CLAUDE.md` and project settings load normally. Native Claude/Codex features are not all interchangeable through an API translator.
 
 ## Remove
 
 1. Finish active proxied sessions and installer runs, then run `claude-codex-proxy paths` to inspect this installation's locations and `claude-codex-proxy stop` to stop its proxy.
 2. If Paseo was configured, remove only `agents.providers.claude-codex` from its config and reload Paseo. Do not restore an old whole-file backup over newer unrelated edits.
 3. Remove the generated `claude-codex` and `claude-codex-proxy` launchers, plus `paseo-codex` if installed. **Do not delete the bin directory itself**, your original Claude/Paseo executables, or the whole Paseo home.
-4. After reviewing the reported paths, remove only this integration's `config_dir`, `data_dir`, and `state_dir` when you no longer need the credentials or session history they contain. This also removes any private Claude installation inside the integration's data directory.
+4. After reviewing the reported paths, remove only this integration's `config_dir`, `data_dir`, and `state_dir` when you no longer need the credentials or terminal session history they contain. This also removes any private Claude installation inside the integration's data directory. Paseo session transcripts live in the daemon's Claude profile and are not affected.
 5. Remove installer-marked PATH entries from shell startup files if desired, or the generated Fish `conf.d/claude-codex.fish` snippet. Keep shared PATH entries that you still need for other programs.
 
 ## Development and verification
@@ -232,9 +239,10 @@ This is a third-party compatibility bridge. Claude's server-side `WebSearch` is 
 python3 -m unittest discover -s tests -v
 ```
 
-The suite contains **55 tests: 44 offline tests and 11 opt-in integration tests**. With the integration environment variables unset, the 11 optional tests are skipped. Offline coverage includes:
+The suite contains **59 tests: 48 offline tests and 11 opt-in integration tests**. With the integration environment variables unset, the 11 optional tests are skipped. Offline coverage includes:
 
 - Model/reasoning normalization and native argument-value boundaries.
+- Paseo launches keeping the daemon's Claude profile, and moving a resumed session's transcript out of the isolated profile exactly once.
 - Login success/failure using temporary fake credentials, including stale credentials and same-content rewrites.
 - Generated shell launchers, runtime PATH, Bash startup-file precedence, and recursion guards.
 - Coordinated installer subprocesses verifying serialization, retained settings, and lock release on failure.
@@ -256,9 +264,9 @@ PASEO_TEST_BINARY=/absolute/path/to/paseo \
   python3 -m unittest discover -s tests -v
 ```
 
-The optional tests verify Anthropic streaming, reasoning translation, option-like system-prompt values reaching the upstream unchanged, tool execution, proxy lifecycle behavior, and complete Paseo sessions including Ultra Code and context accounting. The Paseo tests start/stop their own daemon using temporary configuration; the existing daemon is unaffected. No real Codex backend or subscription quota is used by these tests.
+The optional tests verify Anthropic streaming, reasoning translation, option-like system-prompt values reaching the upstream unchanged, tool execution, proxy lifecycle behavior, and complete Paseo sessions including Ultra Code, context accounting, and transcripts landing in the daemon's Claude profile. The Paseo tests start/stop their own daemon using temporary configuration and a temporary Claude profile; the existing daemon and your `~/.claude` are unaffected. No real Codex backend or subscription quota is used by these tests.
 
-All **55 tests passed** in development validation on Linux ARM64 with CLIProxyAPI 7.2.155, Claude Code 2.1.266, and Paseo 0.8.0-beta.1. macOS and live ChatGPT OAuth were not exercised by this validation; login failures are simulated in offline tests. Model entitlement remains account-dependent, and the installer's live smoke test checks that path after you sign in.
+All **59 tests passed** in development validation on Linux with CLIProxyAPI 7.2.155, Claude Code 2.1.266, and the locally installed Paseo. macOS and live ChatGPT OAuth were not exercised by this validation; login failures are simulated in offline tests. Model entitlement remains account-dependent, and the installer's live smoke test checks that path after you sign in.
 
 ## Upstream references
 
@@ -268,4 +276,4 @@ All **55 tests passed** in development validation on Linux ARM64 with CLIProxyAP
 - [CLIProxyAPI Codex OAuth login](https://help.router-for.me/configuration/provider/codex)
 - [CLIProxyAPI reasoning suffixes](https://help.router-for.me/configuration/thinking) and [pinned Astra model registry](https://github.com/router-for-me/CLIProxyAPI/blob/v7.2.155/internal/registry/models/models.json)
 - [Claude gateway configuration](https://code.claude.com/docs/en/llm-gateway) and [model configuration](https://code.claude.com/docs/en/model-config)
-- [Paseo 0.8.0-beta.1 custom provider schema](https://github.com/getpaseo/paseo/blob/v0.8.0-beta.1/docs/custom-providers.md) and [Claude adapter](https://github.com/getpaseo/paseo/blob/v0.8.0-beta.1/packages/server/src/server/agent/providers/claude/agent.ts)
+- [Paseo custom provider schema](https://github.com/getpaseo/paseo/blob/main/docs/custom-providers.md) and [Claude adapter](https://github.com/getpaseo/paseo/blob/main/packages/server/src/server/agent/providers/claude/agent.ts)

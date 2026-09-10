@@ -10,6 +10,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import unittest
 
 from test_proxy_integration import Upstream, free_port
@@ -41,6 +42,10 @@ class PaseoIntegrationTests(unittest.TestCase):
             paseo_home = base / "paseo"
             env = {key: value for key, value in os.environ.items() if not key.startswith("PASEO_")}
             env["PASEO_HOME"] = str(paseo_home)
+            # The daemon's profile is where Paseo reloads transcripts from; keep
+            # the test out of ~/.claude and check that sessions land there.
+            daemon_profile = base / "daemon-claude"
+            env["CLAUDE_CONFIG_DIR"] = str(daemon_profile)
             env["NO_PROXY"] = "127.0.0.1,localhost"
             env["no_proxy"] = "127.0.0.1,localhost"
             runtime.write_json(paseo_home / "config.json", {
@@ -110,6 +115,14 @@ class PaseoIntegrationTests(unittest.TestCase):
                 ], env=env, capture_output=True, text=True, timeout=90)
                 self.assertEqual(result.returncode, 0, result.stderr[-3000:] + result.stdout[-3000:])
                 self.assertIn("OK", result.stdout)
+                # Claude flushes the transcript shortly after the turn completes.
+                deadline = time.monotonic() + 20
+                while not list((daemon_profile / "projects").rglob("*.jsonl")) and time.monotonic() < deadline:
+                    time.sleep(0.5)
+                self.assertTrue(list((daemon_profile / "projects").rglob("*.jsonl")),
+                                "Paseo session transcript is missing from the daemon's Claude profile")
+                self.assertFalse((base / "config" / "claude" / "projects").exists(),
+                                 "Paseo session was recorded in the isolated terminal profile")
                 if check_usage:
                     agent_id = re.search(r'"agentId"\s*:\s*"([^"]+)"', result.stdout).group(1)
                     client_module = Path(os.environ["PASEO_TEST_BINARY"]).resolve().parents[1] / "dist" / "utils" / "client.js"
