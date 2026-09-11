@@ -131,13 +131,28 @@ def resolve_cli(name, explicit, package, data_dir, previous=None):
     return executable(prefix / "node_modules" / ".bin" / name, name)
 
 
-def detect_paseo(explicit):
+def detect_paseo(explicit, previous=None, data_dir=None):
     # Paseo is managed by the user. Never install it or select a cached version
     # from an earlier claude-codex installation over the user's PATH.
     if explicit:
         return executable(explicit, "paseo")
     found = shutil.which("paseo")
-    return str(Path(found).absolute()) if found else None
+    found = str(Path(found).absolute()) if found else None
+    if found and paseo_compat.desktop_bundle_root(Path(found).resolve()) is None:
+        return found
+    # PATH offers only the desktop app bundle, whose packed server module cannot
+    # be patched, or nothing at all. Reuse the executable selected last time as
+    # long as it is still a user-managed package, not a legacy private copy that
+    # an older installer cached under the data directory.
+    if previous and os.access(previous, os.X_OK) and not Path(previous).is_dir():
+        legacy_prefix = (Path(data_dir) / "npm").resolve() if data_dir else None
+        resolved = Path(previous).resolve()
+        if paseo_compat.desktop_bundle_root(resolved) is None and (
+                legacy_prefix is None or legacy_prefix not in resolved.parents):
+            if found:
+                say(f"Paseo on PATH is the desktop app bundle {found}; reusing previously selected {previous}")
+            return str(Path(previous).absolute())
+    return found
 
 
 def provider(settings):
@@ -296,7 +311,7 @@ def _install_locked(opts, config_dir, data_dir, state_dir, bin_dir):
     port = opts.port if opts.port is not None else previous.get("port", 8317)
     if not 1024 <= port <= 65535:
         raise SetupError("--port must be between 1024 and 65535")
-    detected_paseo = None if opts.skip_paseo else detect_paseo(opts.paseo_bin)
+    detected_paseo = None if opts.skip_paseo else detect_paseo(opts.paseo_bin, previous.get("paseo_bin"), data_dir)
     if detected_paseo and (Path(detected_paseo).name == "paseo-codex"
                            or Path(detected_paseo).resolve() == (bin_dir / "paseo-codex").resolve()):
         raise SetupError("--paseo-bin must point to the original Paseo executable")

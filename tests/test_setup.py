@@ -493,6 +493,20 @@ class InstallTests(unittest.TestCase):
         self.assertEqual(binary.stat().st_mode & 0o777, 0o700)
         self.assertFalse((self.base.parent / "escape").exists())
 
+    def test_desktop_app_bundle_is_rejected_with_npm_guidance(self):
+        resources = self.base / "Paseo.app" / "Contents" / "Resources"
+        entry = resources / "bin" / "paseo"
+        entry.parent.mkdir(parents=True)
+        entry.write_text("#!/bin/sh\nexit 0\n")
+        entry.chmod(0o755)
+        (resources / "app.asar").write_bytes(b"")
+        link = self.base / "paseo"
+        link.symlink_to(entry)
+        with self.assertRaisesRegex(runtime.SetupError, "desktop app.*app.asar.*--paseo-bin") as raised:
+            paseo_compat.find_usage_reader(link)
+        self.assertIn("@getpaseo/cli", str(raised.exception))
+        self.assertIn("--skip-paseo", str(raised.exception))
+
     def test_full_staged_install_and_launch_with_sdk_arguments(self):
         claude = self.fake_cli("claude-original", "import json,os,sys\nprint(json.dumps({'args':sys.argv[1:],'model':os.environ.get('ANTHROPIC_MODEL'),'base':os.environ.get('ANTHROPIC_BASE_URL')}))\n")
         paseo = self.fake_paseo("paseo-original", "print('paseo original')\n")
@@ -633,6 +647,41 @@ class InstallTests(unittest.TestCase):
         private.chmod(0o755)
         with patch.dict(os.environ, {"PATH": ""}):
             self.assertIsNone(install.detect_paseo(None))
+
+    def fake_desktop_bundle(self):
+        resources = self.base / "Paseo.app" / "Contents" / "Resources"
+        entry = resources / "bin" / "paseo"
+        entry.parent.mkdir(parents=True)
+        entry.write_text("#!/bin/sh\necho bundle\n")
+        entry.chmod(0o755)
+        (resources / "app.asar").write_bytes(b"")
+        path_dir = self.base / "bundle-path"
+        path_dir.mkdir()
+        (path_dir / "paseo").symlink_to(entry)
+        return path_dir
+
+    def test_desktop_bundle_on_path_falls_back_to_previously_selected_paseo(self):
+        path_dir = self.fake_desktop_bundle()
+        previous = self.fake_cli("paseo-npm", "print('npm paseo')\n")
+        with patch.dict(os.environ, {"PATH": str(path_dir)}):
+            self.assertEqual(install.detect_paseo(None, str(previous), self.base), str(previous))
+            self.assertEqual(install.detect_paseo(None, None, self.base), str(path_dir / "paseo"))
+            self.assertEqual(install.detect_paseo(None, str(self.base / "gone"), self.base), str(path_dir / "paseo"))
+
+    def test_desktop_bundle_on_path_does_not_fall_back_to_legacy_private_copy(self):
+        path_dir = self.fake_desktop_bundle()
+        private = self.base / "npm" / "paseo" / "node_modules" / ".bin" / "paseo"
+        private.parent.mkdir(parents=True)
+        private.write_text("#!/bin/sh\necho legacy private paseo\n")
+        private.chmod(0o755)
+        with patch.dict(os.environ, {"PATH": str(path_dir)}):
+            self.assertEqual(install.detect_paseo(None, str(private), self.base), str(path_dir / "paseo"))
+
+    def test_usable_paseo_on_path_wins_over_previous_selection(self):
+        previous = self.fake_cli("paseo-previous", "print('previous')\n")
+        system = self.fake_cli("paseo", "print('on path')\n")
+        with patch.dict(os.environ, {"PATH": str(system.parent)}):
+            self.assertEqual(install.detect_paseo(None, str(previous), self.base), str(system))
 
     def test_launcher_refuses_to_replace_unrelated_program(self):
         target = self.base / "claude-codex"

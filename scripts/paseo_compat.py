@@ -182,8 +182,26 @@ def check_task_source(agent_path):
     return path
 
 
+def desktop_bundle_root(entry):
+    # Paseo's desktop app ships its CLI shim next to an Electron app.asar that
+    # packs the server module; files inside that archive cannot be patched.
+    for directory in entry.parents:
+        if (directory / "app.asar").is_file():
+            return directory
+    return None
+
+
 def find_usage_reader(paseo_bin):
     entry = Path(paseo_bin).resolve()
+    bundle = desktop_bundle_root(entry)
+    if bundle is not None:
+        raise SetupError(f"{paseo_bin} is the Paseo desktop app's bundled CLI ({bundle / 'app.asar'}); "
+                         "its Claude provider module is packed inside the app archive and cannot be patched. "
+                         "Install the npm CLI matching the app version into a private prefix, for example "
+                         "npm install -g --prefix ~/.local/share/paseo-cli @getpaseo/cli@$(paseo --version), "
+                         "then rerun ./install.sh --paseo-bin ~/.local/share/paseo-cli/bin/paseo "
+                         "(later reruns reuse that selection while PATH still resolves to the bundle); "
+                         "or use --skip-paseo for terminal-only setup. No package was modified")
     cli_root = None
     for directory in entry.parents:
         manifest = directory / "package.json"
