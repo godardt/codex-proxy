@@ -12,6 +12,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import unittest
 import urllib.error
 import urllib.request
@@ -69,6 +70,24 @@ def tool_events(file_path, usage=None, call_id=None):
         {"type": "response.output_item.added", "output_index": 0, "item": {**item, "arguments": ""}},
         {"type": "response.function_call_arguments.delta", "item_id": item_id, "output_index": 0, "delta": arguments},
         {"type": "response.function_call_arguments.done", "item_id": item_id, "output_index": 0, "arguments": arguments},
+        {"type": "response.output_item.done", "output_index": 0, "item": item},
+        {"type": "response.completed", "response": response},
+    ]
+
+
+def function_call_events(name, arguments, usage=None, call_id=None):
+    item_id = f"fc_{uuid.uuid4().hex}"
+    encoded = json.dumps(arguments)
+    item = {"id": item_id, "type": "function_call", "call_id": call_id or f"call_{uuid.uuid4().hex}",
+            "name": name, "arguments": encoded}
+    response = {"id": f"resp_{uuid.uuid4().hex}", "object": "response", "created_at": 1783616400,
+                "model": runtime.MODEL, "status": "completed", "output": [item],
+                "usage": usage if usage is not None else {"input_tokens": 10, "output_tokens": 5, "total_tokens": 15}}
+    return [
+        created_event(response),
+        {"type": "response.output_item.added", "output_index": 0, "item": {**item, "arguments": ""}},
+        {"type": "response.function_call_arguments.delta", "item_id": item_id, "output_index": 0, "delta": encoded},
+        {"type": "response.function_call_arguments.done", "item_id": item_id, "output_index": 0, "arguments": encoded},
         {"type": "response.output_item.done", "output_index": 0, "item": item},
         {"type": "response.completed", "response": response},
     ]
@@ -138,11 +157,19 @@ class Upstream(BaseHTTPRequestHandler):
             if events is None:
                 self.send_error(503, "Test sequence stopped")
                 return
+        elif "<transcript>" in json.dumps(body.get("input", [])):
+            # Claude's auto-mode classifier prompt; a verdict shape is not needed to
+            # observe that the classifier ran through this gateway.
+            events = response_events(text="<block>false</block>")
         else:
             events = response_events(getattr(self.server, "usage", None))
             fixture = getattr(self.server, "tool_fixture", None)
-            if fixture and not any(item.get("type") == "function_call_output" for item in body.get("input", [])):
-                events = tool_events(fixture)
+            call = getattr(self.server, "tool_call", None)
+            if not any(item.get("type") == "function_call_output" for item in body.get("input", [])):
+                if fixture:
+                    events = tool_events(fixture)
+                elif call:
+                    events = function_call_events(*call)
         data = "".join(f"event: {event['type']}\ndata: {json.dumps(event)}\n\n" for event in events).encode()
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream")
@@ -284,16 +311,18 @@ class ProxyIntegrationTests(unittest.TestCase):
             urllib.request.build_opener(urllib.request.ProxyHandler({})).open(req, timeout=3)
         self.assertEqual(caught.exception.code, 401)
 
-    def run_claude_stream_json(self, extra_args=()):
+    def run_claude_stream_json(self, extra_args=(), allow_tools=True, launcher_settings=True):
         binary = shutil.which(os.environ["CLAUDE_TEST_BINARY"])
         self.assertIsNotNone(binary)
         # A clean cwd/profile and explicit settings sources exclude local plugins.
         args = ["--model", "gpt-6-astra(max)", *extra_args, "-p", "Reply with OK.",
                 "--output-format", "stream-json", "--verbose", "--tools", getattr(self, "claude_tools", ""),
                 "--setting-sources", "", "--strict-mcp-config", "--mcp-config", '{"mcpServers":{}}']
-        if getattr(self, "claude_tools", None):
+        if getattr(self, "claude_tools", None) and allow_tools:
             args += ["--allowedTools", self.claude_tools]
         forwarded, effort = runtime.parse_launch_args(args, "high")
+        if launcher_settings:
+            forwarded = runtime.apply_launcher_settings(forwarded)
         source = {key: value for key, value in os.environ.items()
                   if not key.startswith("PASEO_") and key != "CLAUDE_CODEX_PASEO_USAGE"}
         # These direct-Claude tests must not inherit a parent Paseo launcher's
@@ -316,6 +345,7 @@ class ProxyIntegrationTests(unittest.TestCase):
         self.assertTrue(requests)
         self.assertTrue(all(req["model"] == runtime.MODEL for req in requests))
         self.assertTrue(all(req["reasoning"]["effort"] == "max" for req in requests))
+        self.claude_events = events
         return requests
 
     @unittest.skipUnless(os.environ.get("CLAUDE_TEST_BINARY"), "Set CLAUDE_TEST_BINARY to test the actual Claude harness")
@@ -332,6 +362,97 @@ class ProxyIntegrationTests(unittest.TestCase):
                               if item.get("role") in ("system", "developer")]
                     text = json.dumps(system) + request.get("instructions", "")
                     self.assertIn(literal, text)
+
+    def stream_claude_session(self, extra_args, launcher_settings, prompt="Do the thing."):
+        """Drive Claude the way Paseo's SDK does: stream-json in and out, prompts over stdio."""
+        binary = shutil.which(os.environ["CLAUDE_TEST_BINARY"])
+        self.assertIsNotNone(binary)
+        args = ["--model", "gpt-6-astra(max)", "--output-format", "stream-json", "--verbose",
+                "--input-format", "stream-json", "--permission-prompt-tool", "stdio", *extra_args,
+                "--tools", "Bash", "--setting-sources", "", "--strict-mcp-config", "--mcp-config", '{"mcpServers":{}}']
+        forwarded, effort = runtime.parse_launch_args(args, "high")
+        if launcher_settings:
+            forwarded = runtime.apply_launcher_settings(forwarded)
+        source = {key: value for key, value in os.environ.items()
+                  if not key.startswith("PASEO_") and key != "CLAUDE_CODEX_PASEO_USAGE"}
+        env = runtime.claude_env(self.settings, effort, source)
+        child = subprocess.Popen([binary, *forwarded], cwd=self.base, env=env, stdin=subprocess.PIPE,
+                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        events, prompts = [], []
+        try:
+            message = {"type": "user", "message": {"role": "user", "content": [{"type": "text", "text": prompt}]},
+                       "parent_tool_use_id": None}
+            child.stdin.write((json.dumps(message) + "\n").encode())
+            child.stdin.flush()
+            deadline = time.monotonic() + 120
+            while time.monotonic() < deadline:
+                line = child.stdout.readline()
+                if not line:
+                    break
+                event = json.loads(line)
+                events.append(event)
+                if event.get("type") == "control_request":
+                    request = event.get("request", {})
+                    if request.get("subtype") == "can_use_tool":
+                        prompts.append(request)
+                        answer = {"behavior": "deny", "message": "Denied by the test harness"}
+                    else:
+                        answer = {}
+                    response = {"type": "control_response", "response": {
+                        "subtype": "success", "request_id": event.get("request_id"), "response": answer}}
+                    child.stdin.write((json.dumps(response) + "\n").encode())
+                    child.stdin.flush()
+                if event.get("type") == "result":
+                    break
+            child.stdin.close()
+            child.wait(timeout=30)
+        finally:
+            if child.poll() is None:
+                child.kill()
+                child.wait(timeout=10)
+            stderr = child.stderr.read().decode(errors="replace")
+            child.stdout.close()
+            child.stderr.close()
+        results = [event for event in events if event.get("type") == "result"]
+        self.assertTrue(results, stderr[-3000:])
+        self.assertFalse(results[-1].get("is_error"), results[-1])
+        requests = []
+        while not self.upstream.requests.empty():
+            requests.append(self.upstream.requests.get_nowait()[1])
+        return events, prompts, requests
+
+    @unittest.skipUnless(os.environ.get("CLAUDE_TEST_BINARY"), "Set CLAUDE_TEST_BINARY to test the auto-mode classifier path")
+    def test_real_claude_auto_mode_is_replaced_by_permission_prompts(self):
+        # A write outside the working directory is not on auto mode's fast
+        # paths, so it is exactly the kind of call that reaches the classifier.
+        outside = tempfile.TemporaryDirectory(prefix="claude-codex-auto-mode-")
+        self.addCleanup(outside.cleanup)
+        marker = Path(outside.name) / "marker.txt"
+        self.upstream.tool_call = ("Bash", {
+            "command": f"mkdir -p {marker.parent} && printf classifier-probe > {marker} && cat {marker}",
+            "description": "Write a marker file"})
+        # Without the launcher setting, Claude's auto mode runs its safety
+        # classifier prompt on the session model through this gateway for every
+        # tool call, and denies on its own when it cannot read a verdict.
+        events, prompts, requests = self.stream_claude_session(["--permission-mode", "auto"], launcher_settings=False)
+        init = next(event for event in events if event.get("type") == "system" and event.get("subtype") == "init")
+        self.assertEqual(init.get("permissionMode"), "auto")
+        classifier = [req for req in requests if "<transcript>" in json.dumps(req.get("input", []))]
+        self.assertTrue(classifier, "Expected the auto-mode classifier to reach the gateway")
+        self.assertTrue(all(req["model"] == runtime.MODEL and req["reasoning"]["effort"] == "max" for req in classifier))
+        self.assertEqual(prompts, [], "Auto mode decides without a permission prompt")
+        # With it, Claude starts in its default prompting mode: no classifier
+        # request is made and the Bash call is offered to the approval surface.
+        events, prompts, requests = self.stream_claude_session(["--permission-mode", "auto"], launcher_settings=True)
+        init = next(event for event in events if event.get("type") == "system" and event.get("subtype") == "init")
+        self.assertEqual(init.get("permissionMode"), "default")
+        self.assertFalse([req for req in requests if "<transcript>" in json.dumps(req.get("input", []))])
+        self.assertEqual([prompt.get("tool_name") for prompt in prompts], ["Bash"])
+        results = [item for req in requests for item in req.get("input", [])
+                   if item.get("type") == "function_call_output"]
+        self.assertTrue(results, "Claude did not return a tool result for the Bash call")
+        self.assertIn("Denied by the test harness", json.dumps(results))
+        self.assertFalse(marker.exists(), "A denied prompt must not run the command")
 
     @unittest.skipUnless(os.environ.get("CLAUDE_TEST_BINARY"), "Set CLAUDE_TEST_BINARY to test actual tool execution")
     def test_real_claude_tool_round_trip(self):

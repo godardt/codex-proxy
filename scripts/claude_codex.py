@@ -46,6 +46,16 @@ CLAUDE_OPTIONAL_VALUE_OPTIONS = {
     "--resume", "-r", "--teleport", "--worktree", "-w",
 }
 
+# Claude's auto mode judges every tool call with Anthropic's classifier models.
+# CLIProxyAPI cannot serve those from a Codex subscription, so Claude falls back
+# to running the classifier prompt on the session model, Astra, at the session's
+# reasoning effort: each call adds a full-transcript request, verdicts come from
+# a model the prompt was not written for, and a denial offers no approval prompt.
+# Claude's own setting turns the mode off; the session falls back to its normal
+# permission prompts instead. Set CLAUDE_CODEX_AUTO_MODE=1 to keep auto mode.
+LAUNCHER_SETTINGS = {"permissions": {"disableAutoMode": "disable"}}
+AUTO_MODE_OVERRIDE = "CLAUDE_CODEX_AUTO_MODE"
+
 
 class SetupError(Exception):
     pass
@@ -210,6 +220,57 @@ def parse_launch_args(args, default_effort):
         native_effort = "ultracode"
     native_args = ["--effort", native_effort] if native_effort else []
     return ["--model", model_id(effort), *forwarded, *native_args, *tail], effort
+
+
+def auto_mode_allowed(env):
+    return env.get(AUTO_MODE_OVERRIDE) == "1"
+
+
+def merge_settings(base, updates):
+    merged = dict(base)
+    for key, value in updates.items():
+        if isinstance(value, dict) and isinstance(merged.get(key), dict):
+            merged[key] = merge_settings(merged[key], value)
+        else:
+            merged[key] = value
+    return merged
+
+
+def merged_settings_operand(value, updates):
+    """Layer launcher settings onto a native --settings operand (JSON or file path)."""
+    text = value.strip()
+    try:
+        current = json.loads(text) if text.startswith("{") else json.loads(Path(value).expanduser().read_text())
+    except (OSError, ValueError) as exc:
+        raise SetupError(f"Cannot merge launcher settings into --settings {value!r}: {exc}") from exc
+    if not isinstance(current, dict):
+        raise SetupError(f"--settings must contain a JSON object: {value!r}")
+    return json.dumps(merge_settings(current, updates), separators=(",", ":"))
+
+
+def apply_launcher_settings(args, updates=LAUNCHER_SETTINGS):
+    """Add launcher-owned settings, merging into a caller's --settings if present.
+
+    Claude reads a single --settings operand; a second one would replace the
+    caller's, such as Paseo's Ultra Code or fast-mode settings.
+    """
+    args = list(args)
+    i = 0
+    while i < len(args):
+        arg = args[i]
+        if arg == "--":
+            break  # Everything after a standalone separator is literal prompt text.
+        key, equal, value = arg.partition("=")
+        if key == "--settings":
+            if equal:
+                args[i] = key + "=" + merged_settings_operand(value, updates)
+            elif i + 1 < len(args):
+                args[i + 1] = merged_settings_operand(args[i + 1], updates)
+            return args
+        if key in CLAUDE_VALUE_OPTIONS and not equal:
+            i += 1  # A required operand is never an option or the separator, even if it looks like one.
+        i += 1
+    return args[:i] + ["--settings", json.dumps(updates, separators=(",", ":"))] + args[i:]
 
 
 def isolated_profile(settings):
@@ -601,6 +662,8 @@ def launch(settings, args):
         forwarded, effort = parse_launch_args(
             args, os.environ.get("CLAUDE_CODEX_REASONING", settings["reasoning"]),
         )
+        if not auto_mode_allowed(os.environ):
+            forwarded = apply_launcher_settings(forwarded)
         runtime = Runtime(settings)
         if not runtime.has_login():
             raise SetupError("ChatGPT login is missing. Run claude-codex-proxy login")

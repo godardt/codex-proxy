@@ -23,7 +23,9 @@ import claude_codex
 import paseo_compat
 
 FIXTURE = Path(__file__).resolve().parent / "fixtures" / "paseo_claude_usage.js"
+TASK_SOURCE_FIXTURE = FIXTURE.parent / "subagents" / "live-source.js"
 AGENT_SOURCE = Path("dist/server/server/agent/providers/claude/agent.js")
+TASK_SOURCE = AGENT_SOURCE.parent / "subagents" / "live-source.js"
 NODE = shutil.which("node")
 INITIALIZER = (
     "new ClaudeContextUsageState(findClaudeModel(this.config.model)?.contextWindowMaxTokens)"
@@ -37,44 +39,36 @@ PATCHED_INITIALIZER = (
 class PatchSourceTests(unittest.TestCase):
     def setUp(self):
         self.source = FIXTURE.read_text()
+        self.edits = paseo_compat.replacements()
 
-    def test_patch_is_narrow_and_idempotent(self):
+    def test_patch_is_narrow_reversible_and_idempotent(self):
         transformed = paseo_compat.patch_source(self.source)
         self.assertNotEqual(transformed, self.source)
         self.assertEqual(paseo_compat.patch_source(transformed), transformed)
-        self.assertEqual(transformed.count("class ClaudeCodexBaseContextUsageState {"), 1)
-        self.assertEqual(transformed.count(
-            "class ClaudeContextUsageState extends ClaudeCodexBaseContextUsageState {"), 1)
+        for upstream, patched in self.edits:
+            self.assertEqual(transformed.count(patched), 1, patched[:80])
         self.assertEqual(transformed.count(PATCHED_INITIALIZER), 1)
         self.assertNotIn(INITIALIZER + ";", transformed)
+        self.assertNotIn(paseo_compat.TASK_SOURCE_IMPORT, transformed)
+        self.assertNotIn(paseo_compat.AVAILABLE_MODES, transformed)
         native = self.source.split("class ClaudeContextUsageState {", 1)[1].split(
-            "class ClaudeAgentSession {", 1)[0]
+            "\nconst DEFAULT_MODES = [", 1)[0]
         self.assertIn("class ClaudeCodexBaseContextUsageState {" + native, transformed)
-        self.assertTrue(transformed.endswith(self.source.split("class ClaudeAgentSession {", 1)[1]
-                                           .replace(INITIALIZER, PATCHED_INITIALIZER)))
+        # Every edit is a one-to-one rewrite: undoing them restores the upstream file exactly.
+        self.assertEqual(paseo_compat.reverse_edits(transformed, self.edits), self.source)
+        # Skills, tasks, and modes are only rewired; no upstream function is removed.
+        for retained in ("function readClaudeHistoricalSubagentToolCalls(entries) {",
+                         "function claudeAutoModeUnavailableOn(env) {",
+                         "translateSidechainFrameToEvents(message, parentToolUseId) {"):
+            self.assertEqual(transformed.count(retained), 1, retained)
 
     def test_unknown_missing_or_duplicate_anchors_fail_closed(self):
-        anchors = (
-            "class ClaudeContextUsageState {",
-            "class ClaudeAgentSession {",
-            "function toObjectRecord(value) {",
-            "constructor(initialContextWindowMaxTokens) {",
-            "setInitialContextWindowMaxTokens(contextWindowMaxTokens) {",
-            "recordModelUsage(modelUsage) {",
-            "buildStreamUsageEvent(event) {",
-            "createUsageUpdatedEvent(contextWindowUsedTokens) {",
-            "buildCompactionUsageEvent(postTokens) {",
-            "this.contextUsage.setInitialContextWindowMaxTokens(findClaudeModel(this.config.model)?.contextWindowMaxTokens);",
-            "this.streamUsedTokens() ?? activeResultUsageTokens ?? this.compactedContextWindowUsedTokens",
-            "this.streamRequestInputTokens = inputTokens;",
-            "this.streamRequestOutputTokens = outputTokens;",
-            INITIALIZER,
-        )
+        anchors = (*paseo_compat.AGENT_ANCHORS, *(upstream for upstream, _ in self.edits))
         for anchor in anchors:
             self.assertEqual(self.source.count(anchor), 1, anchor)
             for candidate in (self.source.replace(anchor, "unsupported_anchor", 1),
                               self.source + "\n" + anchor + "\n"):
-                with self.subTest(anchor=anchor, duplicate=candidate.startswith(self.source)):
+                with self.subTest(anchor=anchor[:60], duplicate=candidate.startswith(self.source)):
                     with self.assertRaises(claude_codex.SetupError):
                         paseo_compat.patch_source(candidate)
         with self.assertRaises(claude_codex.SetupError):
@@ -96,10 +90,13 @@ class PatchSourceTests(unittest.TestCase):
             self.source.replace("class ClaudeContextUsageState {",
                                 "class ClaudeCodexBaseContextUsageState {", 1),
             self.source.replace(INITIALIZER, PATCHED_INITIALIZER, 1),
+            self.source.replace(paseo_compat.MODE_CATALOG, paseo_compat.PATCHED_MODE_CATALOG, 1),
             transformed.replace(PATCHED_INITIALIZER, INITIALIZER, 1),
+            transformed.replace(paseo_compat.PATCHED_RESOLVE_SIDECHAIN, paseo_compat.RESOLVE_SIDECHAIN, 1),
             transformed.replace("class ClaudeCodexBaseContextUsageState {",
                                 "class ChangedBaseContextUsageState {", 1),
             transformed.replace("CLAUDE_CODEX_PASEO_USAGE", "CHANGED_USAGE_MARKER", 1),
+            transformed.replace("declareForkedSkill(parentToolUseId)", "declareForkedSkill(otherId)", 1),
             transformed + "\n" + transformed,
         )
         for index, candidate in enumerate(candidates):
@@ -107,9 +104,27 @@ class PatchSourceTests(unittest.TestCase):
                 with self.assertRaises(claude_codex.SetupError):
                     paseo_compat.patch_source(candidate)
 
+    def test_previous_installer_layout_is_upgraded_to_the_current_patch(self):
+        previous = self.source
+        for upstream, patched in paseo_compat.previous_replacements():
+            self.assertEqual(previous.count(upstream), 1, upstream[:60])
+            previous = previous.replace(upstream, patched, 1)
+        self.assertIn(paseo_compat.PATCH_MARKER, previous)
+        self.assertNotEqual(previous, paseo_compat.patch_source(self.source))
+        upgraded = paseo_compat.patch_source(previous)
+        self.assertEqual(upgraded, paseo_compat.patch_source(self.source))
+        self.assertEqual(paseo_compat.patch_source(upgraded), upgraded)
+        # A locally edited earlier patch is neither trusted nor upgraded blindly.
+        for candidate in (previous.replace("this.codexLateUsage = launchEnv", "this.codexLateUsage = process.env", 1),
+                          previous.replace(PATCHED_INITIALIZER, INITIALIZER, 1)):
+            with self.assertRaises(claude_codex.SetupError):
+                paseo_compat.patch_source(candidate)
+
 
 @unittest.skipUnless(NODE, "Node is required to execute the transformed fixture in memory")
-class UsageStateTests(unittest.TestCase):
+class NodeFixtureTests(unittest.TestCase):
+    """Runs JavaScript against the transformed fixture with shared message helpers."""
+
     def run_js(self, body, *, transformed=True, process_env=None):
         source = FIXTURE.read_text()
         if transformed:
@@ -136,11 +151,15 @@ class UsageStateTests(unittest.TestCase):
             [NODE, "--input-type=module"],
             input=source + "\n" + textwrap.dedent(helpers) + textwrap.dedent(body),
             text=True, capture_output=True, timeout=10,
+            # The fixture imports Paseo's subagent modules from beside itself.
+            cwd=FIXTURE.parent,
             # Do not inherit preload hooks or provider configuration from the host.
             env={"PATH": os.defpath, **(process_env or {})},
         )
         self.assertEqual(result.returncode, 0, result.stderr)
 
+
+class UsageStateTests(NodeFixtureTests):
     def test_original_fixture_reproduces_missing_live_usage_before_patch(self):
         self.run_js("""
             const state = session().contextUsage;
@@ -325,10 +344,8 @@ class UsageStateTests(unittest.TestCase):
                            "CLAUDE_CODE_MAX_CONTEXT_TOKENS": "9999999"})
 
     def test_unmarked_behavior_matches_original_across_native_state_transitions(self):
-        original = json.dumps(FIXTURE.read_text())
         self.run_js("""
-            const originalModule = await import('data:text/javascript,' + encodeURIComponent(
-        """ + original + """));
+            const originalModule = await import(""" + json.dumps(FIXTURE.as_uri()) + """);
             function trace(State) {
                 const state = new State(200000, {CLAUDE_CODE_MAX_CONTEXT_TOKENS: '1050000'});
                 const events = [];
@@ -451,6 +468,236 @@ class UsageStateTests(unittest.TestCase):
         """)
 
 
+class SubagentTrackingTests(NodeFixtureTests):
+    """Forked skills are declared and finished like announced tasks, for marked sessions only."""
+
+    SCENARIO = """\
+        const skillId = 'call_skill';
+        const mainSkill = {type: 'assistant', parent_tool_use_id: null, message: {content: [
+            {type: 'tool_use', id: skillId, name: 'Skill', input: {skill: 'forky', args: 'review it'}}]}};
+        const forkText = {type: 'assistant', parent_tool_use_id: skillId, message: {model: 'gpt-6-astra',
+            content: [{type: 'text', text: 'working'}]}};
+        const forkAgent = {type: 'assistant', parent_tool_use_id: skillId, message: {content: [
+            {type: 'tool_use', id: 'call_child', name: 'Agent', input: {description: 'grandchild',
+             prompt: 'x', subagent_type: 'general-purpose', run_in_background: true}}]}};
+        const childStarted = {type: 'system', subtype: 'task_started', task_id: 'a1', tool_use_id: 'call_child',
+            task_type: 'local_agent', subagent_type: 'general-purpose', description: 'grandchild',
+            is_backgrounded: true, spawn_depth: 2, prompt: 'x'};
+        const childFrame = {type: 'assistant', parent_tool_use_id: 'call_child', message: {model: 'gpt-6-astra',
+            content: [{type: 'text', text: 'sub done'}]}};
+        const childDone = {type: 'system', subtype: 'task_notification', task_id: 'a1', tool_use_id: 'call_child',
+            status: 'completed', output_file: '', summary: 'ok'};
+        const skillResult = (isError = false) => ({type: 'user', parent_tool_use_id: null, message: {content: [
+            {type: 'tool_result', tool_use_id: skillId, is_error: isError,
+             content: 'Skill "forky" completed (forked execution).'}]},
+            tool_use_result: {status: 'forked', agentId: 'afork', success: !isError}});
+        const trace = (session, messages) => messages.flatMap(message => session.translateMessageToEvents(message));
+        const upserts = events => events.filter(event => event.type === 'provider_subagent' &&
+            event.event.type === 'upsert').map(event => event.event);
+        const cards = events => events.filter(event => event.type === 'timeline');
+    """
+
+    def run_js(self, body, **kwargs):
+        super().run_js(textwrap.dedent(self.SCENARIO) + textwrap.dedent(body), **kwargs)
+
+    def test_forked_skill_is_declared_nested_and_finished_for_marked_sessions(self):
+        self.run_js("""
+            const current = session('custom-model');
+            const opened = trace(current, [mainSkill, forkText]);
+            assert.deepEqual(upserts(opened), [
+                {type: 'upsert', id: skillId, status: 'running', title: 'forky', description: 'review it', toolCallId: skillId},
+                {type: 'upsert', id: skillId, subtitle: 'forky'},
+                {type: 'upsert', id: skillId, subtitle: 'forky · gpt-6-astra'},
+            ]);
+            assert.deepEqual(cards(opened), [], 'The Skill call already has its own card');
+            const launched = trace(current, [forkAgent, childStarted]);
+            const child = upserts(launched).find(event => event.id === 'call_child');
+            assert.equal(child.status, 'running');
+            assert.equal(child.parentSubagentId, skillId, 'Children of the fork nest under it');
+            assert.deepEqual(cards(launched), [], 'A nested child gets no synthetic Task card in the parent transcript');
+            assert.equal(current.taskProtocolSource.ownerSubagentIdByToolUseId.get('call_child'), skillId);
+            assert.ok(current.taskProtocolSource.backgroundedIds.has('call_child'),
+                'task_started announces the background launch');
+            assert.deepEqual(current.taskProtocolSource.cancelRunningForegroundTasks(),
+                [{kind: 'status', id: skillId, status: 'canceled'}], 'Only the foreground fork dies with an interrupted turn');
+            current.taskProtocolSource.lastStatusById.set(skillId, 'running');
+            assert.ok(trace(current, [forkText, childFrame]).length >= 0, 'Later fork frames still route');
+            assert.deepEqual(upserts(trace(current, [childDone])), [{type: 'upsert', id: 'call_child', status: 'completed'}]);
+            assert.deepEqual(upserts(trace(current, [skillResult()])), [{type: 'upsert', id: skillId, status: 'completed'}]);
+            assert.deepEqual(upserts(trace(current, [skillResult()])), [], 'Terminal status is reported once');
+            assert.deepEqual([...current.taskProtocolSource.lastStatusById.values()], ['completed', 'completed']);
+            const failing = session('custom-model');
+            trace(failing, [mainSkill, forkText]);
+            assert.deepEqual(upserts(trace(failing, [skillResult(true)])), [{type: 'upsert', id: skillId, status: 'failed'}]);
+        """)
+
+    def test_fork_tracking_ignores_auto_mode_override_and_process_environment(self):
+        self.run_js("""
+            const overridden = session('custom-model', {...markedEnv, CLAUDE_CODEX_AUTO_MODE: '1'});
+            assert.equal(upserts(trace(overridden, [mainSkill, forkText]))[0].title, 'forky');
+            for (const env of [{}, {CLAUDE_CODEX_PASEO_USAGE: '0'}, {CLAUDE_CODEX_PASEO_USAGE: 'true'}]) {
+                const native = session('custom-model', env);
+                const events = upserts(trace(native, [mainSkill, forkText]));
+                assert.equal(events[0].title, 'Claude subagent', JSON.stringify(env));
+            }
+            const launchOnly = session('custom-model', {}, markedEnv);
+            assert.equal(upserts(trace(launchOnly, [mainSkill, forkText]))[0].title, 'forky');
+        """, process_env={"CLAUDE_CODEX_PASEO_USAGE": "1"})
+
+    def test_unmarked_session_matches_original_provider_events(self):
+        self.run_js("""
+            const originalModule = await import(""" + json.dumps(FIXTURE.as_uri()) + """);
+            const messages = [mainSkill, forkText, forkAgent, childStarted, childFrame, childDone, forkText, skillResult()];
+            const replay = Session => {
+                const current = new Session({model: 'custom-model'}, {runtimeSettings: {env: {}}, launchEnv: {}});
+                const events = trace(current, messages);
+                return {events, statuses: [...current.taskProtocolSource.lastStatusById],
+                        modes: current.getAvailableModes().map(mode => mode.id)};
+            };
+            const patched = replay(ClaudeAgentSession);
+            assert.deepEqual(patched, replay(originalModule.ClaudeAgentSession));
+            // The unmarked path keeps Paseo's own behavior, including the orphaned fork row.
+            const forkRow = upserts(patched.events).filter(event => event.id === skillId);
+            assert.ok(forkRow.length > 0);
+            assert.ok(forkRow.every(event => event.status === 'running'), JSON.stringify(forkRow));
+        """)
+
+    def test_nested_fork_inside_an_announced_child_is_tracked(self):
+        self.run_js("""
+            const current = session('custom-model');
+            trace(current, [mainSkill, forkText, forkAgent, childStarted]);
+            const childSkill = {type: 'assistant', parent_tool_use_id: 'call_child', message: {content: [
+                {type: 'tool_use', id: 'call_skill2', name: 'Skill', input: {skill: 'nested'}}]}};
+            const nestedFrame = {type: 'assistant', parent_tool_use_id: 'call_skill2', message: {content: [
+                {type: 'text', text: 'nested working'}]}};
+            const nestedResult = {type: 'user', parent_tool_use_id: 'call_child', message: {content: [
+                {type: 'tool_result', tool_use_id: 'call_skill2', content: 'Skill "nested" completed (forked execution).'}]}};
+            trace(current, [childSkill]);
+            const declared = upserts(trace(current, [nestedFrame]))[0];
+            assert.equal(declared.id, 'call_skill2');
+            assert.equal(declared.title, 'nested');
+            assert.equal(declared.parentSubagentId, 'call_child');
+            assert.equal(declared.description, undefined);
+            assert.deepEqual(upserts(trace(current, [nestedResult])), [{type: 'upsert', id: 'call_skill2', status: 'completed'}]);
+        """)
+
+    def test_only_skill_calls_are_declared_from_frames(self):
+        self.run_js("""
+            const current = session('custom-model');
+            const plainTool = {type: 'assistant', parent_tool_use_id: null, message: {content: [
+                {type: 'tool_use', id: 'call_bash', name: 'Bash', input: {command: 'true'}}]}};
+            const strayFrame = {type: 'assistant', parent_tool_use_id: 'call_bash', message: {content: [
+                {type: 'text', text: 'unexpected'}]}};
+            trace(current, [plainTool]);
+            const events = trace(current, [strayFrame]);
+            assert.equal(current.taskProtocolSource.isDeclared('call_bash'), false);
+            assert.equal(upserts(events)[0].title, 'Claude subagent', 'Non-skill parents keep the legacy path');
+            const unknownParent = trace(current, [{type: 'assistant', parent_tool_use_id: 'call_unknown',
+                message: {content: [{type: 'text', text: 'x'}]}}]);
+            assert.equal(current.taskProtocolSource.isDeclared('call_unknown'), false);
+        """)
+
+
+class ModeCatalogTests(NodeFixtureTests):
+    def test_marked_provider_environment_removes_auto_mode_unless_overridden(self):
+        self.run_js("""
+            const ids = catalog => catalog.modes.map(mode => mode.id);
+            assert.deepEqual(claudeModeCatalog({}), {modes: DEFAULT_MODES, defaultModeId: 'auto'});
+            const marked = claudeModeCatalog({CLAUDE_CODEX_PASEO_USAGE: '1'});
+            assert.equal(marked.defaultModeId, 'default');
+            assert.deepEqual(ids(marked), ['plan', 'default', 'acceptEdits', 'bypassPermissions']);
+            const overridden = claudeModeCatalog({CLAUDE_CODEX_PASEO_USAGE: '1', CLAUDE_CODEX_AUTO_MODE: '1'});
+            assert.deepEqual(overridden, {modes: DEFAULT_MODES, defaultModeId: 'auto'});
+            for (const marker of [undefined, '', '0', 'true', ' 1']) {
+                assert.equal(claudeModeCatalog({CLAUDE_CODEX_PASEO_USAGE: marker}).defaultModeId, 'auto', String(marker));
+            }
+            for (const value of ['true', '0', '']) {
+                assert.equal(claudeModeCatalog({CLAUDE_CODEX_PASEO_USAGE: '1', CLAUDE_CODEX_AUTO_MODE: value}).defaultModeId,
+                    'default', value);
+            }
+            const bedrock = claudeModeCatalog({CLAUDE_CODE_USE_BEDROCK: '1', CLAUDE_CODEX_PASEO_USAGE: '1',
+                CLAUDE_CODEX_AUTO_MODE: '1'});
+            assert.equal(bedrock.defaultModeId, 'default', "Paseo's own transport rule still wins");
+        """)
+
+    def test_running_session_advertises_the_same_modes_as_the_catalog(self):
+        self.run_js("""
+            const init = {type: 'system', subtype: 'init', permissionMode: 'default'};
+            const marked = session('custom-model');
+            // Paseo may snapshot the modes before Claude's init message arrives.
+            assert.deepEqual(marked.getAvailableModes().map(mode => mode.id), ['plan', 'default', 'acceptEdits', 'bypassPermissions']);
+            marked.translateMessageToEvents(init);
+            assert.deepEqual(marked.getAvailableModes().map(mode => mode.id), ['plan', 'default', 'acceptEdits', 'bypassPermissions']);
+            assert.equal(marked.currentMode, 'default');
+            assert.deepEqual(marked.availableModes, DEFAULT_MODES, 'The stored list is not rewritten');
+            const overridden = session('custom-model', {...markedEnv, CLAUDE_CODEX_AUTO_MODE: '1'});
+            overridden.translateMessageToEvents(init);
+            assert.deepEqual(overridden.getAvailableModes(), DEFAULT_MODES);
+            const native = session('custom-model', {});
+            native.translateMessageToEvents({...init, permissionMode: 'auto'});
+            assert.deepEqual(native.getAvailableModes(), DEFAULT_MODES);
+            assert.equal(native.currentMode, 'auto');
+            const launchOverride = session('custom-model', markedEnv, {CLAUDE_CODEX_AUTO_MODE: '1'});
+            launchOverride.translateMessageToEvents(init);
+            assert.deepEqual(launchOverride.getAvailableModes(), DEFAULT_MODES);
+        """)
+
+
+class ReplayFactsTests(NodeFixtureTests):
+    ENTRIES = """\
+        const skillUse = {type: 'assistant', uuid: 'u1', message: {content: [
+            {type: 'tool_use', id: 'call_skill', name: 'Skill', input: {skill: 'forky', args: 'review it'}}]}};
+        const skillResult = (result, isError = false) => ({type: 'user', uuid: 'u2', message: {content: [
+            {type: 'tool_result', tool_use_id: 'call_skill', is_error: isError, content: 'Skill "forky" completed (forked execution).'}]},
+            toolUseResult: result});
+        const forked = {success: true, commandName: 'forky', status: 'forked', agentId: 'afork', result: 'ok'};
+        const agentUse = {type: 'assistant', isSidechain: true, agentId: 'afork', message: {content: [
+            {type: 'tool_use', id: 'call_child', name: 'Agent', input: {description: 'grandchild', subagent_type: 'general-purpose'}}]}};
+        const lines = entries => entries.map(entry => JSON.stringify(entry)).join('\\n') + '\\n';
+    """
+
+    def run_js(self, body, **kwargs):
+        super().run_js(textwrap.dedent(self.ENTRIES) + textwrap.dedent(body), **kwargs)
+
+    def test_forked_skill_results_link_the_child_transcript_when_requested(self):
+        self.run_js("""
+            const facts = readClaudeReplayParentFacts([skillUse, skillResult(forked)], true);
+            assert.deepEqual(facts.toolCalls.get('call_skill'), {title: 'forky', description: 'review it'});
+            assert.deepEqual(facts.linksByAgentId.get('afork'), {toolCallId: 'call_skill', failed: false});
+            assert.deepEqual(facts.outcomesByToolCallId.get('call_skill'), {failed: false});
+            const failed = readClaudeReplayParentFacts([skillUse, skillResult({...forked, success: false}, true)], true);
+            assert.deepEqual(failed.linksByAgentId.get('afork'), {toolCallId: 'call_skill', failed: true});
+            const inline = readClaudeReplayParentFacts([skillUse, skillResult({status: 'completed', result: 'ok'})], true);
+            assert.equal(inline.linksByAgentId.size, 0, 'A skill that ran inline has no child transcript');
+            assert.ok(inline.toolCalls.has('call_skill'));
+            const noCall = readClaudeReplayParentFacts([skillResult(forked)], true);
+            assert.equal(noCall.linksByAgentId.size, 0, 'A result without its Skill call proves nothing');
+            const snake = readClaudeReplayParentFacts([skillUse, {...skillResult(undefined), tool_use_result: forked}], true);
+            assert.deepEqual(snake.linksByAgentId.get('afork'), {toolCallId: 'call_skill', failed: false});
+        """)
+
+    def test_default_and_unmarked_replay_keep_upstream_facts(self):
+        self.run_js("""
+            const originalModule = await import(""" + json.dumps(FIXTURE.as_uri()) + """);
+            const entries = [skillUse, skillResult(forked), agentUse];
+            const upstream = originalModule.readClaudeReplayParentFacts(entries);
+            assert.deepEqual(readClaudeReplayParentFacts(entries), upstream);
+            assert.deepEqual(readClaudeReplayParentFacts(entries, false), upstream);
+            assert.equal(upstream.toolCalls.has('call_skill'), false);
+            assert.deepEqual(upstream.toolCalls.get('call_child'), {title: 'general-purpose', description: 'grandchild'});
+            const sidechains = {contents: [lines([agentUse])], metaByAgentId: new Map()};
+            const marked = session('custom-model').ingestPersistedSidechains(lines([skillUse, skillResult(forked)]), sidechains);
+            assert.deepEqual(marked.parent.linksByAgentId.get('afork'), {toolCallId: 'call_skill', failed: false});
+            assert.deepEqual(marked.subagents[0].parentFacts.toolCalls.get('call_child'),
+                {title: 'general-purpose', description: 'grandchild'});
+            const native = session('custom-model', {}).ingestPersistedSidechains(lines([skillUse, skillResult(forked)]), sidechains);
+            assert.equal(native.parent.toolCalls.size, 0);
+            assert.deepEqual(native, originalModule.ClaudeAgentSession.prototype.ingestPersistedSidechains.call(
+                new originalModule.ClaudeAgentSession({model: 'custom-model'}, {runtimeSettings: {env: {}}, launchEnv: {}}),
+                lines([skillUse, skillResult(forked)]), sidechains));
+        """)
+
+
 @unittest.skipUnless(NODE, "Node is required to syntax-check temporary package fixtures")
 class PatchFileTests(unittest.TestCase):
     def setUp(self):
@@ -482,7 +729,31 @@ class PatchFileTests(unittest.TestCase):
         target = root / AGENT_SOURCE
         target.parent.mkdir(parents=True)
         target.write_text(self.source)
+        sibling = root / TASK_SOURCE
+        sibling.parent.mkdir(parents=True)
+        shutil.copyfile(TASK_SOURCE_FIXTURE, sibling)
         return target
+
+    def test_missing_or_unsupported_task_protocol_source_fails_without_changes(self):
+        sibling = self.target.parent / "subagents" / "live-source.js"
+        original = sibling.read_text()
+        backup = Mock()
+        for candidate in (original.replace("this.backgroundedIds = new Set();", "", 1),
+                          original + "\nexport class ClaudeTaskProtocolSource {}\n", None):
+            with self.subTest(candidate="missing" if candidate is None else candidate[-40:]):
+                if candidate is None:
+                    sibling.unlink()
+                else:
+                    sibling.write_text(candidate)
+                with self.assertRaisesRegex(claude_codex.SetupError, "task protocol source"):
+                    paseo_compat.prepare_patch(self.binary)
+                with self.assertRaisesRegex(claude_codex.SetupError, "task protocol source"):
+                    paseo_compat.apply_patch(self.target, backup)
+        backup.assert_not_called()
+        self.assertEqual(self.target.read_text(), self.source)
+        sibling.write_text(original)
+        self.assertEqual(paseo_compat.prepare_patch(self.binary), self.target.resolve())
+        self.assertEqual(sibling.read_text(), original, "The sibling module is read, never modified")
 
     def backup(self, path):
         self.assertEqual(path, self.target.resolve())

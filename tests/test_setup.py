@@ -75,6 +75,43 @@ class LauncherTests(unittest.TestCase):
         self.assertEqual(env["CLAUDE_CONFIG_DIR"], "/tmp/test config/claude")
         self.assertEqual(env["NO_PROXY"], "example.test,127.0.0.1,localhost")
 
+    def test_launcher_settings_disable_auto_mode_without_replacing_native_settings(self):
+        launcher = {"permissions": {"disableAutoMode": "disable"}}
+        appended = runtime.apply_launcher_settings(["--model", "gpt-6-astra(high)", "-p", "--", "--settings", "literal"])
+        self.assertEqual(appended, ["--model", "gpt-6-astra(high)", "-p", "--settings", json.dumps(launcher, separators=(",", ":")),
+                                    "--", "--settings", "literal"])
+        # Paseo passes its own --settings for Ultra Code and fast mode; Claude
+        # reads one operand, so the launcher merges rather than replaces it.
+        merged = runtime.apply_launcher_settings(
+            ["--model", "x", "--settings", '{"ultracode":true,"permissions":{"allow":["Bash"]}}', "--effort", "ultracode"])
+        self.assertEqual(merged[:3] + merged[4:], ["--model", "x", "--settings", "--effort", "ultracode"])
+        self.assertEqual(json.loads(merged[3]),
+                         {"ultracode": True, "permissions": {"allow": ["Bash"], "disableAutoMode": "disable"}})
+        inline = runtime.apply_launcher_settings(['--settings={"fastMode":false}'])
+        self.assertEqual(inline[0][:11], "--settings=")
+        self.assertEqual(json.loads(inline[0][11:]), {"fastMode": False, **launcher})
+        # An operand that merely looks like the option or the separator is left alone.
+        self.assertEqual(runtime.apply_launcher_settings(["--append-system-prompt", "--settings"]),
+                         ["--append-system-prompt", "--settings", "--settings", json.dumps(launcher, separators=(",", ":"))])
+        self.assertEqual(runtime.apply_launcher_settings(["--append-system-prompt", "--", "-p", "Hi", "--", "--settings", "x"]),
+                         ["--append-system-prompt", "--", "-p", "Hi", "--settings", json.dumps(launcher, separators=(",", ":")),
+                          "--", "--settings", "x"])
+        with tempfile.TemporaryDirectory() as temp:
+            settings_file = Path(temp) / "claude-settings.json"
+            settings_file.write_text('{"env": {"FOO": "1"}, "permissions": {"deny": ["WebSearch"]}}')
+            from_file = runtime.apply_launcher_settings(["--settings", str(settings_file), "-p"])
+            self.assertEqual(json.loads(from_file[1]),
+                             {"env": {"FOO": "1"}, "permissions": {"deny": ["WebSearch"], "disableAutoMode": "disable"}})
+            settings_file.write_text("not json")
+            with self.assertRaises(runtime.SetupError):
+                runtime.apply_launcher_settings(["--settings", str(settings_file)])
+        for operand in ('["not", "an", "object"]', str(Path(tempfile.gettempdir()) / "missing-claude-settings.json")):
+            with self.subTest(operand=operand), self.assertRaises(runtime.SetupError):
+                runtime.apply_launcher_settings(["--settings", operand])
+        self.assertTrue(runtime.auto_mode_allowed({"CLAUDE_CODEX_AUTO_MODE": "1"}))
+        for value in ({}, {"CLAUDE_CODEX_AUTO_MODE": "true"}, {"CLAUDE_CODEX_AUTO_MODE": "0"}):
+            self.assertFalse(runtime.auto_mode_allowed(value))
+
     def test_paseo_sessions_use_the_daemon_profile(self):
         # Paseo reloads transcripts from the daemon's CLAUDE_CONFIG_DIR or ~/.claude,
         # not from the provider environment, so Paseo launches keep that profile.
@@ -121,6 +158,9 @@ class InstallTests(unittest.TestCase):
         reader = server / paseo_compat.AGENT_PATH
         reader.parent.mkdir(parents=True)
         reader.write_text((ROOT / "tests" / "fixtures" / "paseo_claude_usage.js").read_text())
+        task_source = server / paseo_compat.AGENT_PATH.parent / paseo_compat.TASK_SOURCE_PATH
+        task_source.parent.mkdir(parents=True)
+        shutil.copyfile(ROOT / "tests" / "fixtures" / "subagents" / "live-source.js", task_source)
         target = self.base / name
         target.symlink_to(entry)
         return target
@@ -506,8 +546,16 @@ class InstallTests(unittest.TestCase):
             runtime.launch(first, ["--model", "gpt-6-astra(xhigh)", "--input-format", "stream-json", "-p"])
         binary, forwarded, env = execute.call_args.args
         self.assertEqual(binary, str(claude))
-        self.assertEqual(forwarded, [str(claude), "--model", "gpt-6-astra(xhigh)", "--input-format", "stream-json", "-p"])
+        # Claude's own setting keeps its auto-mode classifier off this gateway;
+        # the session falls back to ordinary permission prompts.
+        self.assertEqual(forwarded, [str(claude), "--model", "gpt-6-astra(xhigh)", "--input-format", "stream-json", "-p",
+                                     "--settings", '{"permissions":{"disableAutoMode":"disable"}}'])
         self.assertEqual(env["ANTHROPIC_DEFAULT_SONNET_MODEL"], "gpt-6-astra(xhigh)")
+        with patch.object(runtime.Runtime, "has_login", return_value=True), \
+             patch.object(runtime.Runtime, "start"), patch.object(runtime.os, "execve") as execute, \
+             patch.dict(os.environ, {"CLAUDE_CODEX_AUTO_MODE": "1"}):
+            runtime.launch(first, ["--model", "gpt-6-astra(xhigh)", "-p"])
+        self.assertEqual(execute.call_args.args[1], [str(claude), "--model", "gpt-6-astra(xhigh)", "-p"])
 
     def test_unsupported_paseo_reader_fails_before_installation_changes(self):
         paseo = self.fake_paseo("paseo-original", "print('original Paseo')\n")
