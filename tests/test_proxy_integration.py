@@ -15,6 +15,7 @@ import threading
 import unittest
 import urllib.error
 import urllib.request
+import uuid
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 import claude_codex as runtime
@@ -26,10 +27,17 @@ def free_port():
         return sock.getsockname()[1]
 
 
-def response_events(usage=None):
-    content = {"type": "output_text", "text": "OK", "annotations": []}
-    item = {"id": "msg_test", "type": "message", "role": "assistant", "status": "completed", "content": [content]}
-    response = {"id": "resp_test", "object": "response", "created_at": 1783616400,
+def created_event(response):
+    # Codex's measured counts arrive at completion, not at response creation.
+    created = {key: value for key, value in response.items() if key != "usage"}
+    return {"type": "response.created", "response": {**created, "status": "in_progress", "output": []}}
+
+
+def response_events(usage=None, text="OK"):
+    item_id = f"msg_{uuid.uuid4().hex}"
+    content = {"type": "output_text", "text": text, "annotations": []}
+    item = {"id": item_id, "type": "message", "role": "assistant", "status": "completed", "content": [content]}
+    response = {"id": f"resp_{uuid.uuid4().hex}", "object": "response", "created_at": 1783616400,
                 "model": runtime.MODEL, "status": "completed", "output": [item],
                 "usage": {"input_tokens": 10, "output_tokens": 2, "total_tokens": 12,
                           "input_tokens_details": {"cached_tokens": 0},
@@ -37,32 +45,84 @@ def response_events(usage=None):
     if usage is not None:
         response["usage"] = usage
     return [
-        {"type": "response.created", "response": {**response, "status": "in_progress", "output": []}},
+        created_event(response),
         {"type": "response.output_item.added", "output_index": 0, "item": {**item, "status": "in_progress", "content": []}},
-        {"type": "response.content_part.added", "item_id": "msg_test", "output_index": 0, "content_index": 0, "part": {**content, "text": ""}},
-        {"type": "response.output_text.delta", "item_id": "msg_test", "output_index": 0, "content_index": 0, "delta": "OK"},
-        {"type": "response.output_text.done", "item_id": "msg_test", "output_index": 0, "content_index": 0, "text": "OK"},
-        {"type": "response.content_part.done", "item_id": "msg_test", "output_index": 0, "content_index": 0, "part": content},
+        {"type": "response.content_part.added", "item_id": item_id, "output_index": 0, "content_index": 0, "part": {**content, "text": ""}},
+        {"type": "response.output_text.delta", "item_id": item_id, "output_index": 0, "content_index": 0, "delta": text},
+        {"type": "response.output_text.done", "item_id": item_id, "output_index": 0, "content_index": 0, "text": text},
+        {"type": "response.content_part.done", "item_id": item_id, "output_index": 0, "content_index": 0, "part": content},
         {"type": "response.output_item.done", "output_index": 0, "item": item},
         {"type": "response.completed", "response": response},
     ]
 
 
-def tool_events(file_path):
+def tool_events(file_path, usage=None, call_id=None):
+    item_id = f"fc_{uuid.uuid4().hex}"
     arguments = json.dumps({"file_path": str(file_path)})
-    item = {"id": "fc_test", "type": "function_call", "call_id": "call_test",
+    item = {"id": item_id, "type": "function_call", "call_id": call_id or f"call_{uuid.uuid4().hex}",
             "name": "Read", "arguments": arguments}
-    response = {"id": "resp_tool", "object": "response", "created_at": 1783616400,
+    response = {"id": f"resp_{uuid.uuid4().hex}", "object": "response", "created_at": 1783616400,
                 "model": runtime.MODEL, "status": "completed", "output": [item],
-                "usage": {"input_tokens": 10, "output_tokens": 5, "total_tokens": 15}}
+                "usage": usage if usage is not None else {"input_tokens": 10, "output_tokens": 5, "total_tokens": 15}}
     return [
-        {"type": "response.created", "response": {**response, "status": "in_progress", "output": []}},
+        created_event(response),
         {"type": "response.output_item.added", "output_index": 0, "item": {**item, "arguments": ""}},
-        {"type": "response.function_call_arguments.delta", "item_id": "fc_test", "output_index": 0, "delta": arguments},
-        {"type": "response.function_call_arguments.done", "item_id": "fc_test", "output_index": 0, "arguments": arguments},
+        {"type": "response.function_call_arguments.delta", "item_id": item_id, "output_index": 0, "delta": arguments},
+        {"type": "response.function_call_arguments.done", "item_id": item_id, "output_index": 0, "arguments": arguments},
         {"type": "response.output_item.done", "output_index": 0, "item": item},
         {"type": "response.completed", "response": response},
     ]
+
+
+class GatedReadSequence:
+    """Read → Read → text in one turn, with the next requests held before SSE."""
+
+    def __init__(self, base):
+        self.markers = ("first-real-read-output", "second-real-read-output")
+        self.fixtures = [base / f"live-read-{index}.txt" for index in range(2)]
+        self.call_ids = [f"call_{uuid.uuid4().hex}" for _ in self.fixtures]
+        for fixture, marker in zip(self.fixtures, self.markers):
+            fixture.write_text(marker + "\n")
+        self.usages = [
+            {"input_tokens": 120000, "output_tokens": 500, "total_tokens": 120500,
+             "input_tokens_details": {"cached_tokens": 90000}},
+            {"input_tokens": 180000, "output_tokens": 650, "total_tokens": 180650,
+             "input_tokens_details": {"cached_tokens": 150000}},
+            {"input_tokens": 210000, "output_tokens": 800, "total_tokens": 210800,
+             "input_tokens_details": {"cached_tokens": 170000}},
+        ]
+        self.final_text = "OK: both real Read calls completed."
+        self.responses = [
+            tool_events(fixture, usage, call_id)
+            for fixture, usage, call_id in zip(self.fixtures, self.usages, self.call_ids)
+        ] + [response_events(self.usages[-1], self.final_text)]
+        self.requests = []
+        self.lock = threading.Lock()
+        self.arrived = [threading.Event() for _ in self.responses]
+        self.release = [threading.Event() for _ in self.responses]
+        self.release[0].set()
+        self.cancelled = threading.Event()
+        self.errors = queue.Queue()
+
+    def events_for(self, body):
+        with self.lock:
+            index = len(self.requests)
+            self.requests.append(body)
+        if index >= len(self.responses):
+            self.errors.put(f"Unexpected upstream request {index + 1}")
+            return None
+        self.arrived[index].set()
+        if not self.release[index].wait(timeout=90):
+            self.errors.put(f"Timed out waiting to release request {index + 1}")
+            return None
+        if self.cancelled.is_set():
+            return None
+        return self.responses[index]
+
+    def close(self):
+        self.cancelled.set()
+        for event in self.release:
+            event.set()
 
 
 class Upstream(BaseHTTPRequestHandler):
@@ -72,16 +132,64 @@ class Upstream(BaseHTTPRequestHandler):
     def do_POST(self):
         body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
         self.server.requests.put((self.path, body))
-        events = response_events(getattr(self.server, "usage", None))
-        fixture = getattr(self.server, "tool_fixture", None)
-        if fixture and not any(item.get("type") == "function_call_output" for item in body.get("input", [])):
-            events = tool_events(fixture)
+        sequence = getattr(self.server, "sequence", None)
+        if sequence is not None:
+            events = sequence.events_for(body)
+            if events is None:
+                self.send_error(503, "Test sequence stopped")
+                return
+        else:
+            events = response_events(getattr(self.server, "usage", None))
+            fixture = getattr(self.server, "tool_fixture", None)
+            if fixture and not any(item.get("type") == "function_call_output" for item in body.get("input", [])):
+                events = tool_events(fixture)
         data = "".join(f"event: {event['type']}\ndata: {json.dumps(event)}\n\n" for event in events).encode()
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream")
         self.send_header("Content-Length", str(len(data)))
         self.end_headers()
         self.wfile.write(data)
+
+
+class UpstreamFixtureTests(unittest.TestCase):
+    def test_usage_is_late_and_response_and_tool_ids_are_unique(self):
+        usage = {"input_tokens": 120000, "output_tokens": 500, "total_tokens": 120500,
+                 "input_tokens_details": {"cached_tokens": 90000}}
+        streams = [response_events(usage), response_events(usage),
+                   tool_events("/unused/first.txt", usage), tool_events("/unused/second.txt", usage)]
+        response_ids, item_ids, call_ids = [], [], []
+        for events in streams:
+            self.assertNotIn("usage", events[0]["response"])
+            self.assertFalse(any("usage" in event.get("response", {}) for event in events[:-1]))
+            response = events[-1]["response"]
+            self.assertEqual(response["usage"], usage)
+            self.assertEqual(events[0]["response"]["id"], response["id"])
+            response_ids.append(response["id"])
+            item = response["output"][0]
+            item_ids.append(item["id"])
+            if "call_id" in item:
+                call_ids.append(item["call_id"])
+            self.assertTrue(all(event["item_id"] == item["id"] for event in events if "item_id" in event))
+        for ids in (response_ids, item_ids, call_ids):
+            self.assertEqual(len(ids), len(set(ids)))
+
+    def test_read_sequence_holds_following_request_until_released(self):
+        with tempfile.TemporaryDirectory(prefix="claude-codex-gates-") as temp:
+            sequence = GatedReadSequence(Path(temp))
+            try:
+                self.assertEqual(sequence.events_for({}), sequence.responses[0])
+                with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+                    try:
+                        pending = pool.submit(sequence.events_for, {"input": []})
+                        self.assertTrue(sequence.arrived[1].wait(timeout=5))
+                        self.assertFalse(pending.done(), "Following request escaped its Event gate")
+                        sequence.release[1].set()
+                        self.assertEqual(pending.result(timeout=5), sequence.responses[1])
+                    finally:
+                        sequence.close()
+                self.assertTrue(all(event.is_set() for event in sequence.release))
+            finally:
+                sequence.close()
 
 
 @unittest.skipUnless(os.environ.get("CLIPROXYAPI_TEST_BINARY"), "Set CLIPROXYAPI_TEST_BINARY to run real proxy tests")
@@ -134,6 +242,8 @@ class ProxyIntegrationTests(unittest.TestCase):
                 self.assertEqual(payload["reasoning"]["effort"], effort)
 
     def test_streaming_anthropic_protocol(self):
+        self.upstream.usage = {"input_tokens": 120000, "output_tokens": 500, "total_tokens": 120500,
+                               "input_tokens_details": {"cached_tokens": 90000}}
         req = urllib.request.Request(f"http://127.0.0.1:{self.settings['port']}/v1/messages",
             data=json.dumps(self.payload("max", stream=True)).encode(),
             headers={"Authorization": f"Bearer {self.settings['api_key']}",
@@ -143,6 +253,17 @@ class ProxyIntegrationTests(unittest.TestCase):
         self.assertIn("event: message_start", text)
         self.assertIn("event: content_block_delta", text)
         self.assertIn("event: message_stop", text)
+        events = [json.loads(line.removeprefix("data: ")) for line in text.splitlines() if line.startswith("data: {")]
+        start = next(event for event in events if event["type"] == "message_start")
+        # The proxy may synthesize a small provisional estimate at message_start;
+        # the measured input/cache pair must arrive only in message_delta.
+        start_usage = start["message"].get("usage", {})
+        self.assertNotEqual((start_usage.get("input_tokens"), start_usage.get("cache_read_input_tokens", 0)),
+                            (30000, 90000), start)
+        delta = next(event for event in events if event["type"] == "message_delta")
+        self.assertEqual(delta["usage"]["input_tokens"], 30000, delta)
+        self.assertEqual(delta["usage"]["cache_read_input_tokens"], 90000, delta)
+        self.assertEqual(delta["usage"]["output_tokens"], 500, delta)
         self.assertEqual(self.upstream.requests.get(timeout=5)[1]["reasoning"]["effort"], "max")
 
     def test_concurrent_start_reuses_process_and_restart_works(self):
@@ -173,7 +294,11 @@ class ProxyIntegrationTests(unittest.TestCase):
         if getattr(self, "claude_tools", None):
             args += ["--allowedTools", self.claude_tools]
         forwarded, effort = runtime.parse_launch_args(args, "high")
-        env = runtime.claude_env(self.settings, effort)
+        source = {key: value for key, value in os.environ.items()
+                  if not key.startswith("PASEO_") and key != "CLAUDE_CODEX_PASEO_USAGE"}
+        # These direct-Claude tests must not inherit a parent Paseo launcher's
+        # daemon-profile mode; claude_env must select this fixture's profile.
+        env = runtime.claude_env(self.settings, effort, source)
         result = subprocess.run([binary, *forwarded], cwd=self.base, env=env, text=True,
                                 capture_output=True, timeout=60)
         self.assertEqual(result.returncode, 0, result.stderr[-3000:] + result.stdout[-3000:])
