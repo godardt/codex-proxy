@@ -4,6 +4,7 @@ import hashlib
 import io
 import json
 import os
+import shutil
 import socket
 from pathlib import Path
 import subprocess
@@ -18,6 +19,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts"))
 import claude_codex as runtime
 import install
+import paseo_compat
 
 
 class LauncherTests(unittest.TestCase):
@@ -105,6 +107,24 @@ class InstallTests(unittest.TestCase):
         target.chmod(0o755)
         return target
 
+    def fake_paseo(self, name, body):
+        if not shutil.which("node"):
+            self.skipTest("Node.js is required to validate the installed usage adapter")
+        package = self.base / (name + "-package")
+        entry = package / "bin" / "paseo"
+        entry.parent.mkdir(parents=True)
+        entry.write_text(f"#!{sys.executable}\n" + body)
+        entry.chmod(0o755)
+        runtime.write_json(package / "package.json", {"name": "@getpaseo/cli", "type": "module"})
+        server = package / "node_modules" / "@getpaseo" / "server"
+        runtime.write_json(server / "package.json", {"name": "@getpaseo/server", "type": "module"})
+        reader = server / paseo_compat.AGENT_PATH
+        reader.parent.mkdir(parents=True)
+        reader.write_text((ROOT / "tests" / "fixtures" / "paseo_claude_usage.js").read_text())
+        target = self.base / name
+        target.symlink_to(entry)
+        return target
+
     def staged_args(self, *extra):
         claude = self.fake_cli("claude-original", "print('Claude Code')\n")
         proxy = self.fake_cli("proxy-unused", "raise SystemExit(1)\n")
@@ -115,7 +135,7 @@ class InstallTests(unittest.TestCase):
 
     def test_paseo_wrapper_uses_runtime_path_and_quoted_node_prefix(self):
         node = self.fake_cli("node", "print('v22.0.0')\n")
-        paseo = self.fake_cli("paseo", "import json,os,sys\nprint(json.dumps({'path':os.environ['PATH'], 'home':os.environ['PASEO_HOME'], 'args':sys.argv[1:]}))\n")
+        paseo = self.fake_paseo("paseo", "import json,os,sys\nprint(json.dumps({'path':os.environ['PATH'], 'home':os.environ['PASEO_HOME'], 'args':sys.argv[1:]}))\n")
         args = self.staged_args("--paseo-bin", str(paseo))
         installation_path = str(node.parent) + os.pathsep + "/installation-only"
         with patch.dict(os.environ, {"PATH": installation_path}):
@@ -193,7 +213,7 @@ class InstallTests(unittest.TestCase):
             self.assertEqual(target.stat().st_mode & 0o777, 0o640)
 
     def test_recursive_paseo_selections_preserve_installed_wrapper(self):
-        paseo = self.fake_cli("paseo-original", "print('original Paseo')\n")
+        paseo = self.fake_paseo("paseo-original", "print('original Paseo')\n")
         args = self.staged_args()
         install.install(install.parser().parse_args([*args, "--paseo-bin", str(paseo)]))
         wrapper = Path(self.settings["bin_dir"]) / "paseo-codex"
@@ -435,7 +455,7 @@ class InstallTests(unittest.TestCase):
 
     def test_full_staged_install_and_launch_with_sdk_arguments(self):
         claude = self.fake_cli("claude-original", "import json,os,sys\nprint(json.dumps({'args':sys.argv[1:],'model':os.environ.get('ANTHROPIC_MODEL'),'base':os.environ.get('ANTHROPIC_BASE_URL')}))\n")
-        paseo = self.fake_cli("paseo-original", "print('paseo original')\n")
+        paseo = self.fake_paseo("paseo-original", "print('paseo original')\n")
         proxy = self.fake_cli("proxy-unused", "raise SystemExit(1)\n")
         claude_before = claude.read_bytes()
         args = ["bash", str(ROOT / "install.sh"), "--config-dir", self.settings["config_dir"],
@@ -443,11 +463,37 @@ class InstallTests(unittest.TestCase):
                 "--bin-dir", self.settings["bin_dir"], "--paseo-home", str(self.base / "paseo"),
                 "--claude-bin", str(claude), "--paseo-bin", str(paseo), "--proxy-binary", str(proxy),
                 "--skip-login", "--skip-paseo-start", "--no-path"]
+        reader = paseo_compat.find_usage_reader(paseo)
+        original_reader = reader.read_text()
         subprocess.run(args, check=True, capture_output=True, text=True)
         config_file = Path(self.settings["config_dir"]) / "settings.json"
         first = runtime.read_json(config_file)
+        patched_reader = reader.read_text()
+        self.assertEqual(patched_reader, paseo_compat.patch_source(original_reader))
+        backups = list(reader.parent.glob("agent.js.claude-codex-backup-*"))
+        self.assertEqual(len(backups), 1)
+        self.assertEqual(backups[0].read_text(), original_reader)
+        installed_runtime = Path(self.settings["data_dir"]) / "claude_codex.py"
+        installed_runtime.write_text("# outdated installed launcher\n")
+        auth = Path(self.settings["config_dir"]) / "auth" / "preserved.json"
+        runtime.write_json(auth, {"type": "codex", "refresh_token": "dummy-preserve-only"})
+        paseo_config = self.base / "paseo" / "config.json"
+        providers = runtime.read_json(paseo_config)
+        providers["agents"]["providers"]["unrelated"] = {"extends": "codex", "label": "Keep me"}
+        runtime.write_json(paseo_config, providers)
         subprocess.run(args, check=True, capture_output=True, text=True)
-        self.assertEqual(first["api_key"], runtime.read_json(config_file)["api_key"])
+        self.assertEqual(first, runtime.read_json(config_file))
+        self.assertEqual(reader.read_text(), patched_reader)
+        self.assertEqual(list(reader.parent.glob("agent.js.claude-codex-backup-*")), backups)
+        self.assertEqual(installed_runtime.read_bytes(), (ROOT / "scripts" / "claude_codex.py").read_bytes())
+        self.assertEqual(runtime.read_json(auth)["refresh_token"], "dummy-preserve-only")
+        self.assertEqual(runtime.read_json(paseo_config), providers)
+        # A user-managed Paseo reinstall replaces its files; reapplying this
+        # installer must repair that fresh reader, not trust a settings marker.
+        reader.write_text(original_reader)
+        subprocess.run(args, check=True, capture_output=True, text=True)
+        self.assertEqual(reader.read_text(), patched_reader)
+        self.assertEqual(len(list(reader.parent.glob("agent.js.claude-codex-backup-*"))), 2)
         self.assertEqual(claude.read_bytes(), claude_before)
         self.assertEqual(config_file.stat().st_mode & 0o777, 0o600)
         self.assertEqual(Path(self.settings["config_dir"]).stat().st_mode & 0o777, 0o700)
@@ -462,6 +508,24 @@ class InstallTests(unittest.TestCase):
         self.assertEqual(binary, str(claude))
         self.assertEqual(forwarded, [str(claude), "--model", "gpt-6-astra(xhigh)", "--input-format", "stream-json", "-p"])
         self.assertEqual(env["ANTHROPIC_DEFAULT_SONNET_MODEL"], "gpt-6-astra(xhigh)")
+
+    def test_unsupported_paseo_reader_fails_before_installation_changes(self):
+        paseo = self.fake_paseo("paseo-original", "print('original Paseo')\n")
+        reader = paseo_compat.find_usage_reader(paseo)
+        reader.write_text("// unfamiliar upstream implementation\nexport {};\n")
+        original = reader.read_bytes()
+        args = self.staged_args("--paseo-bin", str(paseo))
+        with patch.object(install.Runtime, "stop") as stop, \
+             patch.object(install, "atomic_write") as write, \
+             patch.object(install, "write_json") as write_json:
+            with self.assertRaisesRegex(runtime.SetupError, "Unsupported Paseo"):
+                install.install(install.parser().parse_args(args))
+        stop.assert_not_called()
+        write.assert_not_called()
+        write_json.assert_not_called()
+        self.assertEqual(reader.read_bytes(), original)
+        self.assertFalse(list(reader.parent.glob("agent.js.claude-codex-backup-*")))
+        self.assertFalse((self.base / "paseo-home" / "config.json").exists())
 
     def test_absent_paseo_is_skipped_without_npm_or_config_changes(self):
         claude = self.fake_cli("claude-original", "print('Claude Code')\n")
@@ -479,8 +543,8 @@ class InstallTests(unittest.TestCase):
 
     def test_installer_reuses_system_paseo_over_saved_private_copy(self):
         claude = self.fake_cli("claude-original", "print('Claude Code')\n")
-        system_paseo = self.fake_cli("paseo", "print('paseo on PATH')\n")
-        private_paseo = self.fake_cli("paseo-private", "print('private paseo')\n")
+        system_paseo = self.fake_paseo("paseo", "print('paseo on PATH')\n")
+        private_paseo = self.fake_paseo("paseo-private", "print('private paseo')\n")
         proxy = self.fake_cli("proxy-unused", "raise SystemExit(1)\n")
         original = system_paseo.read_bytes()
         with socket.socket() as probe:
@@ -492,7 +556,11 @@ class InstallTests(unittest.TestCase):
                 "--claude-bin", str(claude), "--proxy-binary", str(proxy), "--skip-login", "--no-path"]
         install.install(install.parser().parse_args(args + ["--paseo-bin", str(private_paseo), "--skip-paseo-start"]))
         test_path = str(self.base) + os.pathsep + os.environ.get("PATH", "")
-        with patch.dict(os.environ, {"PATH": test_path}), patch.object(install.subprocess, "run") as run:
+        def check_activation(command, **kwargs):
+            self.assertIn(paseo_compat.PATCH_MARKER, paseo_compat.find_usage_reader(system_paseo).read_text())
+            return subprocess.CompletedProcess(command, 0)
+        with patch.dict(os.environ, {"PATH": test_path}), patch.object(paseo_compat, "check_syntax"), \
+             patch.object(install.subprocess, "run", side_effect=check_activation) as run:
             install.install(install.parser().parse_args(args))
         self.assertEqual([call.args[0] for call in run.call_args_list],
                          [[str(system_paseo), "daemon", "restart"], [str(system_paseo), "reload"]])

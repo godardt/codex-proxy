@@ -17,6 +17,7 @@ import tarfile
 import tempfile
 import time
 
+import paseo_compat
 from claude_codex import (
     CONTEXT_WINDOW, EFFORTS, REASONING_MODES, ULTRACODE_MODEL, MARKER, MODEL, Runtime, SetupError, atomic_write, model_id,
     file_lock, proxy_config, read_json, say, write_json,
@@ -322,6 +323,8 @@ def _install_locked(opts, config_dir, data_dir, state_dir, bin_dir):
                 owned = False
             if not owned:
                 raise SetupError(f"Refusing to overwrite unrelated program {path}")
+    # Validate before downloads, stopping services, or replacing configuration.
+    paseo_patch = paseo_compat.prepare_patch(detected_paseo) if use_paseo else None
     claude_bin = resolve_cli("claude", opts.claude_bin, f"@anthropic-ai/claude-code@{CLAUDE_VERSION}", data_dir, previous.get("claude_bin"))
     if Path(claude_bin).name == "claude-codex" or Path(claude_bin).resolve() == (bin_dir / "claude-codex").resolve():
         raise SetupError("--claude-bin must point to the original Claude executable")
@@ -341,6 +344,8 @@ def _install_locked(opts, config_dir, data_dir, state_dir, bin_dir):
         settings.update(paseo_bin=paseo_bin, paseo_config=str(paseo_config))
     elif previous.get("paseo_config"):
         settings.update(paseo_config=previous["paseo_config"], paseo_bin=previous.get("paseo_bin"))
+    if paseo_patch is not None:
+        paseo_compat.apply_patch(paseo_patch, backup)
     # Stop only the previously managed process, using its old binary and port.
     if previous:
         Runtime(previous).stop()
